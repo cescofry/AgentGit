@@ -1,0 +1,42 @@
+# Default post-build task: validate the build output, then open a PR.
+name: post-build
+description: Verify that the build output passes tests and checks, then open a PR.
+
+phases:
+  - name: run-tests
+    skill: test-runner
+    description: Run the project test suite against the agent's changes.
+    inputs:
+      workspace: $build.phases.setup-workspace.result.workspace_path
+      test_command: $config.execution.test_command
+    on_failure: block
+    required: true
+
+  - name: check-docs
+    skill: docs-checker
+    description: Verify that documentation is updated for any new public APIs or behavior changes.
+    inputs:
+      workspace: $build.phases.setup-workspace.result.workspace_path
+      diff_summary: $build.phases.execute-plan.result.diff_summary
+    on_failure: warn
+    required: false
+
+  - name: lint-check
+    skill: lint-runner
+    description: Run linting and formatting checks.
+    inputs:
+      workspace: $build.phases.setup-workspace.result.workspace_path
+    on_failure: warn
+    required: false
+
+  - name: create-pr
+    skill: pr-creator
+    description: Commit changes, push branch, and open a PR linked to the issue. Runs only after all validation passes.
+    inputs:
+      issue_context: $issue
+      workspace: $build.phases.setup-workspace.result.workspace_path
+      branch: $build.phases.execute-plan.result.branch
+      diff_summary: $build.phases.execute-plan.result.diff_summary
+      test_results: $phases.run-tests.result
+      warnings: $phases.check-docs.result.warnings
+    required: true

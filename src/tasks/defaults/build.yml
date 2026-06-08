@@ -1,0 +1,24 @@
+# Default build task: execute the approved plan.
+name: build
+description: Execute the approved plan to produce code changes.
+
+phases:
+  - name: setup-workspace
+    skill: workspace-setup
+    description: Clone the repo into an ephemeral workspace and prepare the environment.
+    inputs:
+      repo: $issue.repoUrl
+      branch_prefix: $config.execution.branch_prefix
+    required: true
+
+  - name: execute-plan
+    skill: plan-executor
+    description: Run the coding harness to implement the approved plan.
+    inputs:
+      issue_context: $issue
+      approved_plan: $plan
+      workspace: $phases.setup-workspace.result.workspace_path
+      harness: $config.execution.harness
+      model: $config.execution.model
+    on_failure: block
+    required: true

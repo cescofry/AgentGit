@@ -1,0 +1,13 @@
+# Default pre-plan task: validate the issue before planning begins.
+name: pre-plan
+description: Gate work before planning. Ensures the issue is safe and well-formed.
+
+phases:
+  - name: safety-review
+    skill: task-safety-checker
+    description: Check issue content for malicious intent or disallowed task categories.
+    inputs:
+      issue_context: $issue
+      disallowed_categories: $config.security.disallowed_categories
+    on_failure: lock-security
+    required: true

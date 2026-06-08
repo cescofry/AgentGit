@@ -1,0 +1,24 @@
+# Default plan task: generate an implementation plan.
+name: plan
+description: Generate or revise an implementation plan for the issue.
+
+phases:
+  - name: classify-issue
+    skill: issue-classifier
+    description: Determine the issue type (bug, feature, docs, ui) from labels and content.
+    inputs:
+      issue_context: $issue
+      task_types: $config.task_types
+    required: true
+
+  - name: generate-plan
+    skill: plan-generator
+    description: Produce a structured implementation plan using the coding harness.
+    inputs:
+      issue_context: $issue
+      task_type: $phases.classify-issue.result.task_type
+      instructions: $phases.classify-issue.result.instructions
+      harness: $config.execution.harness
+      model: $config.execution.plan_model
+    on_failure: block
+    required: true

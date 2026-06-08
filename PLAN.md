@@ -1,7 +1,7 @@
 # AgentGit - Research & Planning Document
 
 > **Status**: Phase 1 complete (Research). Phase 2 ready (Planning).
-> **Last updated**: 2026-06-06
+> **Last updated**: 2026-06-07
 
 ---
 
@@ -14,11 +14,13 @@
 5. [Orchestrator: Probot](#orchestrator-probot)
 6. [GitHub Integration](#github-integration)
 7. [Security Model](#security-model)
-8. [State Machine (Label-Based)](#state-machine-label-based)
-9. [Configuration Model](#configuration-model)
-10. [Repository Initialization / Setup Program](#repository-initialization--setup-program)
-11. [Feasibility & Risks](#feasibility--risks)
-12. [MVP Scope](#mvp-scope)
+8. [Task Workflow Model (Skills & Phases)](#task-workflow-model-skills--phases)
+9. [State Machine (Label-Based)](#state-machine-label-based)
+10. [Configuration Model](#configuration-model)
+11. [Repository Initialization / Setup Program](#repository-initialization--setup-program)
+12. [Feasibility & Risks](#feasibility--risks)
+13. [Build Phases](#build-phases)
+14. [MVP Scope](#mvp-scope)
 
 ---
 
@@ -87,6 +89,7 @@ Requirements:
 |   - Webhook listener      |  - Receives issue/comment/label events
 |   - Command parser        |  - Validates admin identity
 |   - Label state machine   |  - Manages state transitions
+|   - Task workflow runner   |  - Executes tasks (phases -> skills)
 |   - Reconciler cron       |  - Recovers from missed webhooks
 +---------------------------+
             |
@@ -95,24 +98,24 @@ Requirements:
 |   Layer 2: Harness        |  OpenCode (primary) / Pi (alternative)
 |   - Plan generation       |  - via CodingHarness interface
 |   - Plan revision         |  - Swappable implementations
-|   - Code execution        |
-|   - PR creation           |
+|   - Code execution        |  - Invoked by skills, not directly
 +---------------------------+
             |
             v
 +---------------------------+
-|   Layer 3: Sandbox        |  Docker / firejail / microVM
-|   - Isolated workspace    |  - Per-issue ephemeral environment
-|   - Resource limits       |  - No long-lived credentials
-|   - Network restrictions  |
+|   Layer 3: Execution Env  |  Ephemeral host workspace (v0.1)
+|   - Ephemeral workspace   |  - Per-issue temp directory
+|   - Dedicated server user |  - No long-lived credentials in workspace
+|   - Minimal env exposure  |  - Docker/firejail/microVM (v0.2+)
 +---------------------------+
 ```
 
 ### Why This Split
 
-- **Probot** owns GitHub identity, webhook handling, and command parsing. It is mature (9.6k stars), well-documented, and purpose-built for GitHub Apps.
-- **OpenCode/Pi** owns the AI planning and coding. Swappable via interface.
-- **Sandbox** keeps execution safe. Agent runs arbitrary repo commands.
+- **Probot** owns GitHub identity, webhook handling, command parsing, and task workflow execution. It resolves which tasks to run, loads their phase definitions, and invokes skills in order. It is mature (9.6k stars), well-documented, and purpose-built for GitHub Apps.
+- **Skills** are the reusable units of work. Built-in skills handle safety checking, plan generation, code execution, test running, and PR creation. Users can add custom skills via `.agentGit/skills/`. Skills are invoked by the orchestrator through task phase definitions.
+- **OpenCode/Pi** owns the AI planning and coding. Swappable via interface. The harness is invoked by specific skills (e.g., `plan-generator`, `plan-executor`), not directly by the orchestrator.
+- **Execution Environment** provides ephemeral per-issue workspaces. In v0.1, this is a host directory on a dedicated server. Docker/firejail/microVM isolation is planned for v0.2+.
 
 ---
 
@@ -528,7 +531,9 @@ Revocation updates the existing metadata comment by setting `revoked_at`.
 
 ### Pre-Plan Safety Gate
 
-Before the agent begins planning or execution, every task must pass a **task safety review**. This is a separate, mandatory step that runs in the orchestrator layer before the coding harness is invoked. It is distinct from agent-level guardrails (e.g., AGENT file restrictions) because it gates whether work begins at all, rather than constraining how work is done.
+Before the agent begins planning or execution, every task must pass a **task safety review**. This is implemented as the default `pre-plan` task, which runs the `task-safety-checker` skill. The pre-plan task is a mandatory step that runs in the orchestrator layer before the coding harness is invoked. It is distinct from agent-level guardrails (e.g., AGENT file restrictions) because it gates whether work begins at all, rather than constraining how work is done.
+
+The safety review is the first default skill in the `pre-plan` task workflow. Users can add additional phases to the `pre-plan` task (e.g., issue completeness validation, duplicate detection) by overriding `.agentGit/tasks/pre-plan.yml`. The `task-safety-checker` skill can also be disabled by removing it from the phase list, though this is not recommended.
 
 #### Why a Separate Step
 
@@ -805,6 +810,338 @@ Workers are treated as potentially malicious. Mitigations:
 
 ---
 
+## Task Workflow Model (Skills & Phases)
+
+### Core Concept
+
+AgentGit organizes its work on an issue as a sequence of **tasks**. Each task is a named workflow stage composed of ordered **phases**. Each phase invokes a **skill** -- a reusable, self-contained unit of work with defined inputs and outputs.
+
+This architecture separates orchestration (which tasks run, in what order) from implementation (what each skill actually does). Tasks remain concise declarative definitions; skills contain the logic.
+
+#### Terminology
+
+| Term | Definition |
+|---|---|
+| **Skill** | A reusable executable unit with a defined interface. A skill receives inputs (issue context, repo config, prior results) and returns a structured result. Skills are the smallest unit of work. |
+| **Phase** | One step within a task. A phase references a skill to execute and defines conditions, inputs, and failure behavior. |
+| **Task** | A named workflow made of ordered phases. Tasks map to the major stages of the issue lifecycle. |
+
+### Default Tasks
+
+AgentGit ships with four default tasks. These are built-in and always available. Users can override them or add new tasks via the `.agentGit/` configuration directory.
+
+| Task | Purpose | When It Runs |
+|---|---|---|
+| `pre-plan` | Gate work before planning begins. Validates that the issue is safe and well-formed. | After admin triggers `/agent plan` or adds `agent:ready`, before `agent:planning`. |
+| `plan` | Generate or revise an implementation plan for the issue. | During the `agent:planning` state. |
+| `build` | Execute the approved plan: write code in an ephemeral workspace. | During the `agent:working` state. |
+| `post-build` | Validate the build output (tests, docs, lint), then open a PR as the final step. | After build completes, before transitioning to `agent:pr-opened`. |
+
+### Default Task Definitions
+
+Each task is a YAML file defining an ordered list of phases. Default tasks ship with AgentGit in `src/tasks/defaults/`. Users can override any default by placing a file with the same name in `.agentGit/tasks/`.
+
+#### `pre-plan.yml`
+
+```yaml
+# Default pre-plan task: validate the issue before planning begins.
+name: pre-plan
+description: Gate work before planning. Ensures the issue is safe and well-formed.
+
+phases:
+  - name: safety-review
+    skill: task-safety-checker
+    description: Check issue content for malicious intent or disallowed task categories.
+    inputs:
+      issue_context: $issue
+      disallowed_categories: $config.security.disallowed_categories
+    on_failure: lock-security
+    required: true
+```
+
+#### `plan.yml`
+
+```yaml
+# Default plan task: generate an implementation plan.
+name: plan
+description: Generate or revise an implementation plan for the issue.
+
+phases:
+  - name: classify-issue
+    skill: issue-classifier
+    description: Determine the issue type (bug, feature, docs, ui) from labels and content.
+    inputs:
+      issue_context: $issue
+      task_types: $config.task_types
+    required: true
+
+  - name: generate-plan
+    skill: plan-generator
+    description: Produce a structured implementation plan using the coding harness.
+    inputs:
+      issue_context: $issue
+      task_type: $phases.classify-issue.result.task_type
+      instructions: $phases.classify-issue.result.instructions
+      harness: $config.execution.harness
+      model: $config.execution.plan_model
+    on_failure: block
+    required: true
+```
+
+#### `build.yml`
+
+```yaml
+# Default build task: execute the approved plan.
+name: build
+description: Execute the approved plan to produce code changes.
+
+phases:
+  - name: setup-workspace
+    skill: workspace-setup
+    description: Clone the repo into an ephemeral workspace and prepare the environment.
+    inputs:
+      repo: $issue.repoUrl
+      branch_prefix: $config.execution.branch_prefix
+    required: true
+
+  - name: execute-plan
+    skill: plan-executor
+    description: Run the coding harness to implement the approved plan.
+    inputs:
+      issue_context: $issue
+      approved_plan: $plan
+      workspace: $phases.setup-workspace.result.workspace_path
+      harness: $config.execution.harness
+      model: $config.execution.model
+    on_failure: block
+    required: true
+```
+
+#### `post-build.yml`
+
+```yaml
+# Default post-build task: validate the build output, then open a PR.
+name: post-build
+description: Verify that the build output passes tests and checks, then open a PR.
+
+phases:
+  - name: run-tests
+    skill: test-runner
+    description: Run the project test suite against the agent's changes.
+    inputs:
+      workspace: $build.phases.setup-workspace.result.workspace_path
+      test_command: $config.execution.test_command
+    on_failure: block
+    required: true
+
+  - name: check-docs
+    skill: docs-checker
+    description: Verify that documentation is updated for any new public APIs or behavior changes.
+    inputs:
+      workspace: $build.phases.setup-workspace.result.workspace_path
+      diff_summary: $build.phases.execute-plan.result.diff_summary
+    on_failure: warn
+    required: false
+
+  - name: lint-check
+    skill: lint-runner
+    description: Run linting and formatting checks.
+    inputs:
+      workspace: $build.phases.setup-workspace.result.workspace_path
+    on_failure: warn
+    required: false
+
+  - name: create-pr
+    skill: pr-creator
+    description: Commit changes, push branch, and open a PR linked to the issue. Runs only after all validation passes.
+    inputs:
+      issue_context: $issue
+      workspace: $build.phases.setup-workspace.result.workspace_path
+      branch: $build.phases.execute-plan.result.branch
+      diff_summary: $build.phases.execute-plan.result.diff_summary
+      test_results: $phases.run-tests.result
+      warnings: $phases.check-docs.result.warnings
+    required: true
+```
+
+### Skill Interface
+
+Every skill implements a common interface. Skills are self-contained -- they receive all context through their inputs and return a structured result.
+
+```ts
+interface SkillInput {
+  [key: string]: any        // Skill-specific input parameters
+}
+
+interface SkillResult {
+  success: boolean
+  data: Record<string, any> // Skill-specific output data
+  warnings: string[]
+  error?: string            // Populated on failure
+}
+
+interface Skill {
+  name: string
+  description: string
+  execute(input: SkillInput, context: ExecutionContext): Promise<SkillResult>
+}
+
+interface ExecutionContext {
+  issueContext: IssueContext
+  repoConfig: RepoConfig
+  logger: Logger
+  harness: CodingHarness
+  workspacePath: string
+}
+```
+
+### Phase Execution Model
+
+The orchestrator runs phases sequentially within a task. Each phase:
+
+1. Resolves its `inputs` by evaluating `$`-prefixed references against the issue context, config, and prior phase results.
+2. Loads the referenced skill.
+3. Executes the skill with the resolved inputs.
+4. Evaluates the result:
+   - On success: stores the result for downstream phases and proceeds.
+   - On failure with `on_failure: block`: transitions the issue to `agent:blocked` and posts an explanation comment.
+   - On failure with `on_failure: lock-security`: transitions to `agent:locked-security`.
+   - On failure with `on_failure: warn`: logs a warning, posts a comment, but continues to the next phase.
+   - On failure with `on_failure: skip`: silently skips and continues.
+5. If `required: true` and the phase fails (regardless of `on_failure`), the entire task fails.
+
+```
+Task: pre-plan
+  |
+  Phase 1: safety-review (skill: task-safety-checker)
+  |   inputs resolved from $issue, $config
+  |   execute skill
+  |   result: { success: true, data: { safe: true } }
+  |
+  v
+Task complete -> transition to agent:planning
+
+Task: plan
+  |
+  Phase 1: classify-issue (skill: issue-classifier)
+  |   result: { task_type: "bug", instructions: "..." }
+  |
+  Phase 2: generate-plan (skill: plan-generator)
+  |   inputs include $phases.classify-issue.result.task_type
+  |   result: { plan: "...", plan_version: 1 }
+  |
+  v
+Task complete -> transition to agent:plan-review
+```
+
+### `.agentGit/` Directory Structure
+
+The `.agentGit/` directory is the canonical location for all AgentGit configuration within a repository. It replaces `.github/agentgit.yml` as the primary configuration path (though `.github/agentgit.yml` remains supported as an alias for backward compatibility).
+
+```
+.agentGit/
+├── config.yml                  # Main configuration (approval, security, execution)
+├── tasks/
+│   ├── pre-plan.yml            # Override default pre-plan task
+│   ├── plan.yml                # Override default plan task
+│   ├── build.yml               # Override default build task
+│   ├── post-build.yml          # Override default post-build task
+│   └── custom-review.yml       # User-defined additional task (example)
+└── skills/
+    ├── custom-linter.yml       # User-defined skill definition (example)
+    └── security-scanner.yml    # User-defined skill definition (example)
+```
+
+#### Configuration Resolution Order
+
+1. `.agentGit/config.yml` (primary)
+2. `.github/agentgit.yml` (fallback / backward compatibility)
+3. Built-in defaults
+
+For tasks:
+
+1. `.agentGit/tasks/<task-name>.yml` (user override)
+2. Built-in default task definition
+
+For skills:
+
+1. `.agentGit/skills/<skill-name>.yml` (user-defined)
+2. Built-in default skill
+
+### User-Defined Skills
+
+Users can define custom skills in `.agentGit/skills/`. A user-defined skill is a YAML file that specifies how to invoke external tooling:
+
+```yaml
+# .agentGit/skills/security-scanner.yml
+name: security-scanner
+description: Run a custom security scanner on the workspace before PR creation.
+
+type: command                   # "command" | "harness" | "script"
+command: npm run security:scan
+working_directory: $workspace
+timeout_minutes: 10
+
+# Expected exit codes
+success_codes: [0]
+warning_codes: [1]             # Non-zero but acceptable (produces warnings)
+failure_codes: [2, 3]          # Hard failure
+
+# Output parsing
+output_format: json            # "json" | "text" | "none"
+result_mapping:
+  success: $.passed
+  warnings: $.warnings
+  data: $.report
+```
+
+Users can then reference this skill in a custom or overridden task:
+
+```yaml
+# .agentGit/tasks/post-build.yml (user override)
+name: post-build
+description: Validate build output with custom security scanning, then open PR.
+
+phases:
+  - name: run-tests
+    skill: test-runner
+    required: true
+    on_failure: block
+
+  - name: security-scan
+    skill: security-scanner      # References .agentGit/skills/security-scanner.yml
+    inputs:
+      workspace: $build.phases.setup-workspace.result.workspace_path
+    required: true
+    on_failure: block
+
+  - name: check-docs
+    skill: docs-checker
+    required: false
+    on_failure: warn
+
+  - name: create-pr
+    skill: pr-creator
+    inputs:
+      issue_context: $issue
+      workspace: $build.phases.setup-workspace.result.workspace_path
+      branch: $build.phases.execute-plan.result.branch
+      diff_summary: $build.phases.execute-plan.result.diff_summary
+    required: true
+```
+
+### Trust Model for User-Defined Content
+
+User-defined tasks and skills in `.agentGit/` are treated as **trusted configuration** because they are committed to the repository and subject to normal code review. This is the same trust model as CI configuration files (`.github/workflows/`, `Jenkinsfile`, etc.).
+
+Constraints:
+
+- `.agentGit/` files are loaded from the repository's default branch, not from the issue branch. This prevents an issue or PR from modifying the workflow that evaluates it.
+- Skills of type `command` or `script` run inside the execution environment (ephemeral workspace), subject to the same resource limits as the coding harness. In v0.2+, these will run inside Docker/firejail for additional isolation.
+- Skills cannot override the core security constraints (HMAC signing, bot identity verification, permission checks). These are enforced by the orchestrator layer, outside the skill system.
+
+---
+
 ## State Machine (Label-Based)
 
 ### Principle
@@ -849,23 +1186,26 @@ Use exactly one `agent:` state label at a time:
 
 ### State Transition Table
 
-| From | Trigger | To |
-|---|---|---|
-| (none) | Admin adds `agent:ready` or comments `/agent plan` | `agent:security-review` |
-| `agent:security-review` | Task passes safety review | `agent:planning` |
-| `agent:security-review` | Task fails safety review | `agent:locked-security` |
-| `agent:locked-security` | Admin comments `/agent unlock-security` | `agent:planning` |
-| `agent:locked-security` | Admin comments `/agent close-unsafe` | Issue closed |
-| `agent:planning` | Plan generated successfully | `agent:plan-review` |
-| `agent:planning` | Plan generation fails | `agent:blocked` |
-| `agent:plan-review` | Admin comments `/agent revise <feedback>` | `agent:planning` |
-| `agent:plan-review` | Admin comments `/agent approve` | `agent:approved` |
-| `agent:approved` | Worker claims job | `agent:working` |
-| `agent:working` | PR opened | `agent:pr-opened` |
-| `agent:working` | Execution fails, needs input | `agent:blocked` |
-| `agent:blocked` | Admin comments `/agent retry` | Previous state |
-| `agent:pr-opened` | PR merged or issue closed | `agent:done` |
-| Any active state | Admin comments `/agent stop` | `agent:cancelled` |
+State transitions are driven by task workflow execution. When a task completes (all phases succeed), the orchestrator transitions to the next state. When a task fails, the transition depends on the phase's `on_failure` setting.
+
+| From | Trigger | Task Executed | To |
+|---|---|---|---|
+| (none) | Admin adds `agent:ready` or comments `/agent plan` | -- | `agent:security-review` |
+| `agent:security-review` | `pre-plan` task passes (all phases succeed) | `pre-plan` | `agent:planning` |
+| `agent:security-review` | `pre-plan` task fails (safety-review phase fails with `on_failure: lock-security`) | `pre-plan` | `agent:locked-security` |
+| `agent:locked-security` | Admin comments `/agent unlock-security` | -- | `agent:planning` |
+| `agent:locked-security` | Admin comments `/agent close-unsafe` | -- | Issue closed |
+| `agent:planning` | `plan` task completes (plan generated successfully) | `plan` | `agent:plan-review` |
+| `agent:planning` | `plan` task fails | `plan` | `agent:blocked` |
+| `agent:plan-review` | Admin comments `/agent revise <feedback>` | -- | `agent:planning` |
+| `agent:plan-review` | Admin comments `/agent approve` | -- | `agent:approved` |
+| `agent:approved` | Worker claims job | -- | `agent:working` |
+| `agent:working` | `build` task completes, then `post-build` task passes (all validations pass and PR is opened) | `build`, `post-build` | `agent:pr-opened` |
+| `agent:working` | `build` task fails | `build` | `agent:blocked` |
+| `agent:working` | `post-build` task fails (required phase, including tests or PR creation) | `post-build` | `agent:blocked` |
+| `agent:blocked` | Admin comments `/agent retry` | -- | Previous state |
+| `agent:pr-opened` | PR merged or issue closed | -- | `agent:done` |
+| Any active state | Admin comments `/agent stop` | -- | `agent:cancelled` |
 
 ### Commands
 
@@ -953,12 +1293,18 @@ This lets the bot reconstruct:
 
 ## Configuration Model
 
+### Configuration Directory: `.agentGit/`
+
+The `.agentGit/` directory is the canonical location for all AgentGit configuration within a repository. It houses the main config file, task workflow definitions, and user-defined skills. See the [Task Workflow Model](#task-workflow-model-skills--phases) section for full details on task and skill definitions.
+
+For backward compatibility, `.github/agentgit.yml` is also supported as a fallback config location.
+
 ### Per-Repository Configuration
 
-Each repo can include a `.github/agentgit.yml` file:
+The main configuration file is `.agentGit/config.yml` (or `.github/agentgit.yml` as fallback):
 
 ```yaml
-# .github/agentgit.yml
+# .agentGit/config.yml
 
 enabled: true
 
@@ -986,7 +1332,8 @@ approval:
 
 # Security settings
 security:
-  # Pre-plan task safety review
+  # Pre-plan task safety review is implemented as the default pre-plan task.
+  # To disable it, override .agentGit/tasks/pre-plan.yml with an empty phases list.
   pre_plan_check:
     enabled: true
     # Lock the issue if safety review fails (vs. just warning)
@@ -1006,37 +1353,18 @@ security:
   # HMAC signing secret for metadata comments (set via environment variable)
   # metadata_signing_secret: $AGENTGIT_SIGNING_SECRET
 
-# Task-type specific instructions
-tasks:
+# Task-type classification: maps labels to task types.
+# Task-type-specific instructions are provided by skills within the plan and build tasks,
+# not as inline config. The issue-classifier skill uses this mapping to determine the type.
+task_types:
   bug:
     labels: [bug, agent:type:bug]
-    instructions: |
-      Focus on minimal, targeted changes.
-      Always add a regression test.
-      Prefer fixing the root cause over workarounds.
-      Do not refactor unrelated code.
-
   feature:
     labels: [enhancement, agent:type:feature]
-    instructions: |
-      Propose the API/UX behavior first in the plan.
-      Follow existing code patterns and conventions.
-      Add documentation for new public APIs.
-      Include unit tests.
-
   docs:
     labels: [documentation, agent:type:docs]
-    instructions: |
-      Use clear, concise language.
-      Include code examples where relevant.
-      Follow existing documentation style.
-
   ui:
     labels: [ui, agent:type:ui]
-    instructions: |
-      Match visual behavior of reference.
-      Include screenshots or visual diffs if possible.
-      Follow existing component patterns.
 
 # Execution settings
 execution:
@@ -1049,40 +1377,56 @@ execution:
   auto_run_tests: true
   max_plan_revisions: 5
 
-# Sandbox settings
-sandbox:
-  type: docker                # docker | firejail | none
-  image: node:20-slim         # base image for workspace
-  network: restricted         # restricted | none | host
-  memory_limit: 4g
-  cpu_limit: 2
+# Execution environment settings
+execution_environment:
+  workspace_root: /tmp/agentgit  # Base directory for ephemeral per-issue workspaces
+  cleanup_on_success: true       # Remove workspace after successful PR creation
+  cleanup_on_failure: false      # Keep workspace for debugging on failure
+  # Docker/firejail sandbox settings (v0.2+, not used in v0.1)
+  # sandbox:
+  #   type: docker
+  #   image: node:20-slim
+  #   network: restricted
+  #   memory_limit: 4g
+  #   cpu_limit: 2
 
 # Distributed worker settings (future, not used in MVP)
 workers:
   enabled: false
-  # Whether to accept jobs from donated worker servers
   accept_donated_workers: false
-  # Repos that donated workers are allowed to serve
   donated_worker_allowed_repos: []
-  # Whether central reruns tests after receiving worker patches
   rerun_checks_on_worker_patches: true
-  # Whether to scan worker patches for secret patterns
   scan_patches_for_secrets: true
 ```
 
+### Task Workflow Configuration
+
+Task behavior is defined as declarative YAML workflow files, not as inline prompt text in the config. Each task is a sequence of phases that invoke skills. See [Task Workflow Model](#task-workflow-model-skills--phases) for full specification.
+
+Default tasks ship with AgentGit and are used unless overridden:
+
+| Task | Default behavior | Override path |
+|---|---|---|
+| `pre-plan` | Run the `task-safety-checker` skill | `.agentGit/tasks/pre-plan.yml` |
+| `plan` | Classify issue type, then generate plan via harness | `.agentGit/tasks/plan.yml` |
+| `build` | Set up workspace, execute plan | `.agentGit/tasks/build.yml` |
+| `post-build` | Run tests, check docs, lint, open PR | `.agentGit/tasks/post-build.yml` |
+
+Users can also add entirely new tasks (e.g., `pre-build.yml`, `custom-review.yml`) and reference them from custom workflow hooks in the config.
+
 ### Default Configuration
 
-If no `.github/agentgit.yml` exists, use sensible defaults:
+If no `.agentGit/config.yml` or `.github/agentgit.yml` exists, use sensible defaults:
 
 - Users with `admin` or `maintain` repo permission are authorized.
 - Delegation enabled; delegated users must have at least `write` permission.
-- Pre-plan safety review enabled; unsafe tasks are locked; admin unlock required.
+- Pre-plan safety review enabled via the default `pre-plan` task; unsafe tasks are locked; admin unlock required.
 - All disallowed task categories active (credential theft, malware, data exfiltration, abuse, policy bypass, destructive changes).
 - Metadata comment HMAC signing enabled (requires `AGENTGIT_SIGNING_SECRET` env var).
-- No task-type-specific instructions (generic prompt).
+- Default task workflows (pre-plan, plan, build, post-build) with built-in skills.
 - OpenCode harness.
 - 60-minute max runtime.
-- Docker sandbox if available, otherwise none.
+- Ephemeral host workspaces under `/tmp/agentgit`. Docker sandbox deferred to v0.2+.
 - `agent/` branch prefix.
 - Distributed workers disabled.
 
@@ -1096,8 +1440,8 @@ AgentGit ships with a setup CLI that helps users configure a repository and serv
 
 | Command | Purpose |
 |---|---|
-| `agentgit setup repo` | Initialize a repository: create `.github/agentgit.yml`, provision `agent:*` labels, validate GitHub App installation, and verify bot permissions. |
-| `agentgit setup server` | Configure the server environment: validate secrets, check harness/sandbox availability, and generate `.env.example`. |
+| `agentgit setup repo` | Initialize a repository: create `.agentGit/` directory with `config.yml`, provision `agent:*` labels, validate GitHub App installation, and verify bot permissions. |
+| `agentgit setup server` | Configure the server environment: validate secrets, check harness availability, and generate `.env.example`. |
 | `agentgit doctor` | Run a comprehensive health check: verify all prerequisites, connectivity, permissions, and configuration consistency. |
 
 ### `agentgit setup repo` -- Repository Setup
@@ -1183,7 +1527,14 @@ Existing labels with the same name are not modified (preserves user customizatio
 
 #### Configuration File Generation
 
-The setup program generates `.github/agentgit.yml` interactively, prompting for:
+The setup program generates the `.agentGit/` directory structure interactively:
+
+- Creates `.agentGit/config.yml` with prompted settings.
+- Creates `.agentGit/tasks/` directory (empty; defaults are used unless overridden).
+- Creates `.agentGit/skills/` directory (empty; for user-defined skills).
+- Optionally creates `.github/agentgit.yml` as a backward-compatible symlink or alias.
+
+Settings prompted during setup:
 
 | Setting | Default | Notes |
 |---|---|---|
@@ -1198,10 +1549,8 @@ The setup program generates `.github/agentgit.yml` interactively, prompting for:
 | Max runtime (minutes) | `60` | Per-task timeout. |
 | Branch prefix | `agent/` | Prefix for agent-created branches. |
 | Test command | `auto` | `auto` = let agent decide, or explicit command. |
-| Sandbox type | `docker` | `docker`, `firejail`, or `none`. |
-| Sandbox image | `node:20-slim` | Base Docker image. |
 
-If `.github/agentgit.yml` already exists, the setup program offers to merge new defaults without overwriting existing values.
+If `.agentGit/config.yml` already exists, the setup program offers to merge new defaults without overwriting existing values. If only `.github/agentgit.yml` exists, the setup program offers to migrate it to `.agentGit/config.yml`.
 
 ### `agentgit setup server` -- Server Setup
 
@@ -1232,7 +1581,7 @@ The setup program validates each secret by making a test call (GitHub API for ap
 | npm / pnpm | `npm --version` or `pnpm --version` | Package manager. |
 | Git | `git --version` >= 2.30 | Required for branch operations. |
 | OpenCode | `opencode --version` | Required if harness is `opencode`. |
-| Docker | `docker info` | Required if sandbox type is `docker`. |
+| Docker | `docker info` | Optional (v0.2+ sandbox). Not required for v0.1. |
 | Network access | HTTP probe to `api.github.com` | Confirms outbound connectivity to GitHub. |
 | Webhook reachability | Optional reverse probe | If a public URL is configured, attempts to confirm it is reachable (guidance only). |
 
@@ -1240,7 +1589,10 @@ The setup program validates each secret by making a test call (GitHub API for ap
 
 | File | Tracked | Purpose |
 |---|---|---|
-| `.github/agentgit.yml` | Yes | Repository configuration (no secrets). |
+| `.agentGit/config.yml` | Yes | Repository configuration (no secrets). |
+| `.agentGit/tasks/` | Yes | User task workflow overrides (empty by default). |
+| `.agentGit/skills/` | Yes | User-defined custom skills (empty by default). |
+| `.github/agentgit.yml` | Yes | Backward-compatible config alias (optional). |
 | `.env.example` | Yes | Template listing all environment variables (no values). |
 | `.env` | No (gitignored) | Actual environment values, local to the server. |
 
@@ -1254,7 +1606,8 @@ agentgit doctor
   Repository
   [OK]  Git remote detected: github.com/octocat/my-project
   [OK]  Default branch: main
-  [OK]  .github/agentgit.yml exists and is valid
+  [OK]  .agentGit/config.yml exists and is valid
+  [OK]  Default tasks loaded (pre-plan, plan, build, post-build)
   [OK]  All 18 agent:* labels exist
 
   GitHub App
@@ -1267,7 +1620,7 @@ agentgit doctor
   [OK]  Node.js v20.11.0
   [OK]  Git v2.43.0
   [OK]  OpenCode v1.2.3
-  [OK]  Docker available (Docker Engine 24.0.7)
+  [INFO] Docker not available (optional, for v0.2+ sandbox)
   [OK]  GITHUB_APP_ID set
   [OK]  GITHUB_APP_PRIVATE_KEY_PATH set (file exists, valid PEM)
   [OK]  GITHUB_WEBHOOK_SECRET set
@@ -1298,7 +1651,7 @@ agentgit setup repo
     ├── Verify bot permissions (issues, PRs, contents, metadata)
     ├── Verify webhook event subscriptions
     ├── Create missing agent:* labels
-    ├── Generate or merge .github/agentgit.yml (interactive prompts)
+    ├── Generate .agentGit/ directory (config.yml, tasks/, skills/)
     └── Print summary + next steps
           |
           v
@@ -1306,7 +1659,7 @@ agentgit setup server  (on deployment machine)
     |
     ├── Check environment variables (prompt for missing)
     ├── Generate .env.example
-    ├── Validate prerequisites (node, git, opencode, docker)
+    ├── Validate prerequisites (node, git, opencode)
     ├── Test LLM provider API key
     ├── Test GitHub connectivity
     └── Print summary + next steps
@@ -1336,7 +1689,7 @@ agentgit doctor  (anytime, to verify health)
 
 | Area | Risk | Mitigation |
 |---|---|---|
-| Safe execution | Agent runs arbitrary repo commands | Docker sandbox, resource limits, no long-lived creds, ephemeral workspaces. |
+| Safe execution | Agent runs arbitrary repo commands | Dedicated server/user, ephemeral workspaces, no long-lived creds, minimal env exposure. Docker sandbox planned for v0.2+. |
 | Plan quality | LLM may produce poor plans | Admin review loop, max revision limit, confidence scoring. |
 | Concurrency | Two webhooks for same issue | Label-based idempotent claiming, single-instance deployment for MVP. |
 | Cost control | LLM calls can be expensive | Max runtime, max iterations, per-issue budget tracking in comments. |
@@ -1359,34 +1712,400 @@ agentgit doctor  (anytime, to verify health)
 
 ---
 
+## Build Phases
+
+The MVP is divided into 15 phases. Each phase produces a testable increment. Phases are ordered by dependency: later phases build on earlier ones. Within each phase, the build, test, and acceptance criteria are defined so that the phase can be validated independently before moving on.
+
+### Recommended First Vertical Slice
+
+For an early visible demo, build these phases first: 0, 1, 2, 3, 8, 11. This produces a bot that can receive commands, check authorization, transition labels, and post signed plans -- before any code execution exists.
+
+### Phase 0: Project Scaffold
+
+**Goal**: Runnable TypeScript/Probot project with test infrastructure.
+
+**Build**:
+- `package.json`, `tsconfig.json`, ESLint config, test runner setup (Vitest or Jest).
+- `src/index.ts` -- Probot app entrypoint that loads and starts.
+- Basic environment variable loader and validation.
+- Structured logger utility.
+
+**Test**:
+- Unit test runner works (`npm test` exits 0).
+- App loads without crashing with mocked environment.
+- Env validation rejects missing required GitHub App variables.
+
+**Acceptance**: `npm test` passes. Local Probot app can start with mocked config and respond to a health-check endpoint.
+
+### Phase 1: Command Parser + Authorization
+
+**Goal**: Parse `/agent ...` comments and decide whether the sender may act.
+
+**Build**:
+- Command parser for all MVP commands: `plan`, `approve`, `revise`, `run`, `stop`, `retry`, `delegate`, `undelegate`, `delegates`, `status`, `unlock-security`, `close-unsafe`, `security-status`.
+- GitHub collaborator permission lookup wrapper (calls `GET /repos/{owner}/{repo}/collaborators/{username}/permission`).
+- Authorization matrix implementation: admin-only commands, delegatable commands, public commands.
+- Config defaults for `approval.required_permissions` and `approval.allowed_users`.
+
+**Test**:
+- Parser returns correct command/args for valid inputs, `null` for non-commands.
+- Parser handles edge cases: extra whitespace, mixed case, commands inside larger text.
+- Authorization tests with mocked GitHub permission responses for each permission level.
+- Admin-only commands rejected for `write`-level users.
+- Public commands allowed for any user.
+
+**Acceptance**: Bot can distinguish public, delegated, maintainer, and rejected commands given mocked GitHub API responses.
+
+### Phase 2: Labels + State Machine
+
+**Goal**: Implement durable issue state using GitHub labels.
+
+**Build**:
+- Core state label definitions (11 labels).
+- Classification label definitions (7 labels).
+- State transition helper: given current state + trigger, return next state or rejection.
+- "Exactly one core state label" enforcement (remove old state label before adding new one).
+- Issue claim logic: fresh label refetch from GitHub API before acting, re-check after label change.
+
+**Test**:
+- Every valid transition in the state transition table produces the correct new state.
+- Invalid transitions (e.g., `agent:done` -> `agent:planning`) are rejected.
+- Label replacement is atomic: old state removed, new state added.
+- Idempotent: applying the same transition twice does not create duplicate labels.
+
+**Acceptance**: Given a mocked issue, state transitions are deterministic and recoverable. The label set on the issue always contains exactly one core state label.
+
+### Phase 3: Metadata Comments + Signing
+
+**Goal**: Store trusted structured state in bot comments with HMAC verification.
+
+**Build**:
+- HTML metadata comment parser: extract `<!-- agent-metadata {...} -->` blocks.
+- HTML metadata comment writer: generate comment body with embedded signed JSON.
+- HMAC-SHA256 signing: compute signature over canonical JSON (excluding `signature` field).
+- HMAC verification: recompute and compare.
+- Bot author verification: check `comment.user.login` and `comment.user.type`.
+- Metadata types: `plan`, `delegation`, `failure`, `execution`.
+
+**Test**:
+- Round-trip: write metadata, parse it back, verify all fields preserved.
+- Valid signature passes verification.
+- Tampered metadata (modified field) fails verification.
+- Metadata from non-bot author (correct format but wrong `user.type`) is rejected.
+- Missing signature field is rejected.
+
+**Acceptance**: Bot only trusts metadata that is signed by itself. No unsigned or tampered metadata is accepted.
+
+### Phase 4: Delegation
+
+**Goal**: Support issue-scoped delegated control via metadata comments.
+
+**Build**:
+- `/agent delegate @user [scope]` -- create signed delegation metadata comment.
+- `/agent undelegate @user` -- update existing delegation comment with `revoked_at`.
+- `/agent delegates` -- list active (non-revoked) delegations for the issue.
+- Active delegation lookup: scan issue comments for valid signed delegation metadata.
+- Delegation-aware authorization: integrate into the Phase 1 authorization flow.
+
+**Test**:
+- Delegate creates a signed metadata comment with correct scopes.
+- Undelegate sets `revoked_at` on the existing comment.
+- Delegated user can run delegatable commands.
+- Delegated user cannot run admin-only commands (`stop`, `delegate`, `undelegate`).
+- Delegation from a user without `maintain`+ permission is rejected.
+- Delegated user below `min_delegate_permission` is rejected.
+
+**Acceptance**: Maintainers can delegate issue workflow commands to `write`-level users without granting full repo control.
+
+### Phase 5: Config + Task Definition Loading
+
+**Goal**: Load per-repo configuration and resolve task definitions.
+
+**Build**:
+- `.agentGit/config.yml` loader with schema validation.
+- `.github/agentgit.yml` fallback loader.
+- Built-in default config values.
+- Built-in default task definitions: `pre-plan.yml`, `plan.yml`, `build.yml`, `post-build.yml`.
+- Task override loading from `.agentGit/tasks/` (user file takes precedence over built-in).
+- Config merge logic: user config extends defaults, does not replace entirely.
+
+**Test**:
+- Missing config file produces valid defaults.
+- Partial config file merges with defaults correctly.
+- Invalid config (bad types, unknown keys) produces clear validation errors.
+- User task override replaces the built-in task of the same name.
+- User task override with unknown skill name is caught at load time.
+
+**Acceptance**: Every repo resolves to a valid, complete config and a full set of task definitions.
+
+### Phase 6: Task Runner + Skill Registry
+
+**Goal**: Execute declarative task phases, independent of GitHub event handling.
+
+**Build**:
+- `Skill` interface and `SkillResult` type.
+- Built-in skill registry: discover and load skills by name.
+- User-defined skill loader from `.agentGit/skills/` (type `command` only for v0.1).
+- `$`-prefixed input resolver: resolve references like `$issue`, `$config.execution.harness`, `$phases.classify-issue.result.task_type`.
+- Sequential phase executor: run phases in order, pass results forward.
+- Phase failure handling: `block` -> transition to `agent:blocked`; `lock-security` -> transition to `agent:locked-security`; `warn` -> log and continue; `skip` -> silent continue.
+- `required: true` enforcement: if a required phase fails, the entire task fails regardless of `on_failure`.
+
+**Test**:
+- Phases execute in order; each receives resolved inputs from prior phases.
+- `$` references resolve correctly against issue context, config, and prior results.
+- Unknown `$` references produce clear errors.
+- `on_failure: block` stops execution and returns failure.
+- `on_failure: warn` logs but continues to next phase.
+- Required phase failure causes task failure even with `on_failure: warn`.
+
+**Acceptance**: A task can run against mock skills and produce stored phase results with correct sequencing, resolution, and failure semantics.
+
+### Phase 7: Pre-Plan Safety Gate
+
+**Goal**: Block unsafe issues before planning begins.
+
+**Build**:
+- `task-safety-checker` skill implementation.
+- Deterministic pattern rules for each disallowed category (credential theft, malware, data exfiltration, abuse, policy bypass, destructive change).
+- LLM-assisted classifier wrapper (optional; calls a short classification prompt treating issue text as data).
+- Security lock metadata comment (kind: `security-lock`).
+- `/agent unlock-security` command handler.
+- `/agent close-unsafe` command handler.
+- `/agent security-status` command handler.
+- State transitions: `agent:security-review` -> `agent:locked-security` on failure; `agent:locked-security` -> `agent:planning` on unlock.
+
+**Test**:
+- Each disallowed category has at least one test case that triggers detection.
+- Safe issues pass the checker.
+- Locked issue cannot proceed to planning.
+- `/agent unlock-security` from admin transitions to `agent:planning`.
+- `/agent unlock-security` from non-admin is rejected.
+- `/agent close-unsafe` closes the issue.
+
+**Acceptance**: `/agent plan` always passes through security review first. Unsafe issues are locked until explicit admin action.
+
+### Phase 8: Planning Flow
+
+**Goal**: Generate and iterate plans without editing code.
+
+**Build**:
+- `issue-classifier` skill: determine task type from labels and content.
+- `plan-generator` skill: invoke OpenCode harness in plan mode.
+- OpenCode planning harness wrapper: call `opencode run --agent plan` and parse output.
+- Plan metadata comment with version number, content hash, and HMAC signature.
+- `/agent plan` handler: trigger `pre-plan` then `plan` task.
+- `/agent revise <feedback>` handler: re-run `plan` task with feedback context.
+- `/agent approve` handler: verify approval matches latest plan version/hash, transition to `agent:approved`.
+
+**Test**:
+- Mocked OpenCode returns a plan; bot posts signed plan comment.
+- Plan version increments on revision.
+- `/agent approve` on latest plan version succeeds.
+- `/agent approve` after a new revision (stale version) is handled correctly.
+- `/agent revise` re-enters `agent:planning` and generates a new plan.
+
+**Acceptance**: Bot can post a signed plan, accept revisions, and move the issue to `agent:plan-review` and then `agent:approved`.
+
+### Phase 9: Workspace + Build Execution
+
+**Goal**: Implement approved plans in an ephemeral host workspace.
+
+**Build**:
+- Workspace manager: create/cleanup temp directories under `execution_environment.workspace_root`.
+- `workspace-setup` skill: clone repo, create agent branch, checkout.
+- `plan-executor` skill: invoke OpenCode harness in build mode.
+- OpenCode build harness wrapper: call `opencode run --agent build` in the workspace directory.
+- Branch naming: `{branch_prefix}issue-{number}-{slug}`.
+- Diff summary extraction from git.
+
+**Test**:
+- Workspace is created under configured root and cleaned up on success.
+- Workspace is preserved on failure when `cleanup_on_failure: false`.
+- Mocked OpenCode execution produces file changes in workspace.
+- Branch name follows naming convention.
+- Diff summary is extracted correctly.
+
+**Acceptance**: An approved issue can produce local repo changes on an agent branch in an ephemeral workspace, without opening a PR.
+
+### Phase 10: Post-Build Validation + PR Creation
+
+**Goal**: Validate changes, then open a PR as the final post-build phase.
+
+**Build**:
+- `test-runner` skill: run configured test command (or detect and run if `auto`).
+- `docs-checker` skill: check for documentation updates on public API changes.
+- `lint-runner` skill: run linting/formatting checks.
+- `pr-creator` skill: commit, push branch, open PR with signed metadata body, link to issue.
+- PR body includes signed metadata (kind: `execution`, issue number, branch, diff summary hash).
+- PR provenance verification helper.
+
+**Test**:
+- Test failure (`on_failure: block`) prevents PR creation.
+- Docs/lint warnings (`on_failure: warn`) allow PR creation with warnings noted.
+- PR body contains valid signed metadata.
+- PR is linked to the originating issue.
+- Mocked Octokit PR creation is called with correct parameters.
+
+**Acceptance**: No PR is opened unless all required validation phases pass. PR metadata is signed and verifiable.
+
+### Phase 11: Webhook Integration End-to-End
+
+**Goal**: Wire commands, labels, task runner, and state transitions into live webhook handlers.
+
+**Build**:
+- `issue_comment.created` webhook handler: parse command, authorize, dispatch.
+- `issues.labeled` webhook handler: detect `agent:ready`, trigger flow.
+- `pull_request.closed` webhook handler: detect merge, transition to `agent:done`.
+- Command dispatchers for all MVP commands.
+- Issue context loader: fetch issue title, body, comments, labels from GitHub API.
+- Bot response comments: status updates, error messages, progress indicators.
+
+**Test**:
+- Webhook fixture for `/agent plan` drives full mocked flow: security review -> planning -> plan posted.
+- Webhook fixture for `/agent approve` drives: approved -> working -> post-build -> PR opened.
+- Unauthorized command produces rejection comment.
+- `/agent stop` from any active state transitions to `agent:cancelled`.
+- `/agent status` returns current state summary.
+
+**Acceptance**: Mocked GitHub webhooks drive the full issue lifecycle from `/agent plan` through `agent:pr-opened`.
+
+### Phase 12: Reconciler
+
+**Goal**: Recover from missed webhooks and stuck states.
+
+**Build**:
+- Installed repo scanner: list all repos with active AgentGit installations.
+- Stale state detection: find issues in `agent:planning`, `agent:working`, or `agent:approved` where the last bot comment is older than `max_runtime_minutes`.
+- Timeout handler: transition stale issues to `agent:blocked` with explanation comment.
+- Idempotent reconciliation: skip issues that are already being handled or have recent activity.
+- Periodic cron: `setInterval` every 10 minutes.
+
+**Test**:
+- Stale `agent:planning` issue (last bot comment > 30 min ago) transitions to `agent:blocked`.
+- Fresh `agent:planning` issue (recent bot comment) is skipped.
+- Repeated reconcile runs do not produce duplicate comments.
+- `agent:blocked` issues are not re-blocked.
+
+**Acceptance**: Process restart or missed webhook does not permanently strand issues. Reconciler recovers stuck states within one cron interval.
+
+### Phase 13: Setup CLI + Doctor
+
+**Goal**: Make installation and configuration usable for repo maintainers.
+
+**Build**:
+- `agentgit setup repo`: detect git remote, prompt for GitHub App credentials, validate installation, verify permissions, create missing `agent:*` labels, generate `.agentGit/` directory.
+- `agentgit setup server`: check environment variables, validate prerequisites (Node.js, Git, OpenCode), generate `.env.example`.
+- `agentgit doctor`: run all checks from both setup commands without modifying anything, output pass/warn/fail checklist.
+- Label provisioning: create all 18 labels with correct colors and descriptions.
+- Interactive prompts for setup wizard.
+
+**Test**:
+- CLI unit tests for each setup step with mocked GitHub API.
+- Dry-run setup creates correct directory structure and config file.
+- Doctor reports correct pass/fail/warn for each check.
+- Doctor exit codes: `0` for all pass, `1` for failures, `2` for warnings only.
+
+**Acceptance**: A maintainer can configure a repo and server without manual label creation or config file authoring.
+
+### Phase 14: Real-Repo Smoke Test
+
+**Goal**: Validate the full system end-to-end on a real GitHub repository.
+
+**Build**:
+- Disposable test repository (or documented setup for a fixture repo).
+- Smoke test script documenting the manual or semi-automated steps.
+
+**Test**:
+1. Create an issue on the test repo.
+2. Add `agent:ready` label or comment `/agent plan`.
+3. Verify safety review passes and plan is posted.
+4. Comment `/agent revise <feedback>` and verify revised plan.
+5. Comment `/agent approve`.
+6. Verify agent implements a small change.
+7. Verify tests pass (or skip gracefully).
+8. Verify PR is opened with signed metadata and linked to the issue.
+9. Merge PR and verify issue transitions to `agent:done`.
+
+**Acceptance**: One full issue-to-PR flow succeeds against real GitHub. All state transitions, metadata comments, and labels match the specification.
+
+### Phase Dependency Graph
+
+```
+Phase 0: Scaffold
+    |
+    v
+Phase 1: Parser + Auth ──────────────────────────┐
+    |                                             |
+    v                                             v
+Phase 2: Labels + State          Phase 3: Metadata + Signing
+    |                                             |
+    |                      ┌──────────────────────┤
+    v                      v                      v
+Phase 5: Config + Tasks    Phase 4: Delegation    |
+    |                                             |
+    v                                             |
+Phase 6: Task Runner + Skills <───────────────────┘
+    |
+    ├──────────────────┐
+    v                  v
+Phase 7: Safety Gate   Phase 8: Planning Flow
+    |                  |
+    v                  v
+    └──────> Phase 11: Webhook Integration <──────┐
+                  |                               |
+                  v                               |
+             Phase 9: Workspace + Build           |
+                  |                               |
+                  v                               |
+             Phase 10: Post-Build + PR ───────────┘
+                  |
+                  v
+             Phase 12: Reconciler
+                  |
+                  v
+             Phase 13: Setup CLI
+                  |
+                  v
+             Phase 14: Smoke Test
+```
+
+---
+
 ## MVP Scope
 
 ### In Scope (v0.1)
 
 - [ ] Probot-based GitHub App, deployed on a single Linux server.
 - [ ] Webhook listener for `issue_comment.created` and `issues.labeled`.
-- [ ] Command parser for `/agent plan`, `/agent approve`, `/agent revise`, `/agent stop`, `/agent delegate`, `/agent undelegate`, `/agent delegates`, `/agent status`.
+- [ ] Command parser for `/agent plan`, `/agent approve`, `/agent revise`, `/agent run`, `/agent stop`, `/agent retry`, `/agent delegate`, `/agent undelegate`, `/agent delegates`, `/agent status`, `/agent unlock-security`, `/agent close-unsafe`, `/agent security-status`.
 - [ ] Permission-based authorization using GitHub collaborator permission API.
 - [ ] Issue-scoped delegation via `/agent delegate` with metadata comment storage.
 - [ ] Label-based state machine (11 core labels, including security states).
-- [ ] Pre-plan task safety review (deterministic rules + LLM-assisted scan).
+- [ ] Task workflow runner: load task definitions, resolve phase inputs, execute skills in order.
+- [ ] Default tasks: `pre-plan`, `plan`, `build`, `post-build`.
+- [ ] Built-in skills: `task-safety-checker`, `issue-classifier`, `plan-generator`, `plan-executor`, `workspace-setup`, `pr-creator`, `test-runner`, `docs-checker`, `lint-runner`.
+- [ ] Skill interface and registry for loading built-in and user-defined skills.
+- [ ] `.agentGit/` directory structure: `config.yml`, `tasks/`, `skills/`.
+- [ ] User-overridable task definitions via `.agentGit/tasks/`.
+- [ ] User-defined skills via `.agentGit/skills/`.
+- [ ] Pre-plan task safety review (deterministic rules + LLM-assisted scan) implemented as the `task-safety-checker` skill.
 - [ ] Security lock flow (`agent:security-review` -> `agent:locked-security` -> `/agent unlock-security`).
 - [ ] HMAC-SHA256 signing of all metadata comments.
 - [ ] Bot comment provenance verification (author identity + HMAC).
-- [ ] OpenCode harness via `opencode run` (plan agent + build agent).
+- [ ] OpenCode harness via `opencode run` (plan agent + build agent), invoked by skills.
 - [ ] Bot posts plan as a comment with signed metadata.
-- [ ] Bot creates branch, commits changes, opens PR on approval.
+- [ ] Bot creates branch, commits changes, validates output, and opens PR as the final post-build step.
 - [ ] PR provenance verification (author, branch prefix, signed metadata).
-- [ ] Per-repo `.github/agentgit.yml` config (including security settings).
-- [ ] Docker-based sandbox for execution.
+- [ ] Per-repo `.agentGit/config.yml` config with `.github/agentgit.yml` fallback.
+- [ ] Ephemeral per-issue workspaces on host (dedicated server, no Docker in v0.1).
 - [ ] Reconciler cron (every 10 minutes).
-- [ ] Single task-type instruction set.
-- [ ] Setup CLI (`agentgit setup repo`, `agentgit setup server`, `agentgit doctor`) for interactive initialization, label provisioning, config generation, and health checks.
+- [ ] Setup CLI (`agentgit setup repo`, `agentgit setup server`, `agentgit doctor`) for interactive initialization, `.agentGit/` scaffolding, label provisioning, config generation, and health checks.
 
 ### Out of Scope (v0.2+)
 
+- [ ] Docker/firejail/microVM sandbox for command execution.
 - [ ] Pi harness implementation.
-- [ ] Multiple task-type instruction profiles.
 - [ ] PR self-review before notifying admin.
 - [ ] Cost tracking and per-issue budgets.
 - [ ] Multi-replica deployment with distributed locking.
@@ -1402,17 +2121,19 @@ agentgit doctor  (anytime, to verify health)
 - [ ] Central patch re-verification for worker-submitted code.
 - [ ] Secret pattern scanning for worker patches.
 - [ ] Worker provenance in PR metadata and commit trailers.
+- [ ] Skill marketplace / community skill sharing.
 
 ### Tech Stack (MVP)
 
 | Component | Technology |
 |---|---|
 | Orchestrator | Probot (TypeScript, Node.js) |
-| Coding harness | OpenCode (`opencode run` / SDK) |
-| Sandbox | Docker (per-issue containers) |
+| Task runner | Built-in task workflow engine (YAML task definitions, skill phases) |
+| Coding harness | OpenCode (`opencode run` / SDK), invoked by skills |
+| Execution environment | Ephemeral host workspaces (Docker sandbox in v0.2+) |
 | State store | GitHub labels + comments (no DB) |
 | Deployment | Single Linux server, systemd service |
-| Config | `.github/agentgit.yml` per repo |
+| Config | `.agentGit/` directory per repo (config, tasks, skills) |
 
 ### Directory Structure (Proposed)
 
@@ -1438,6 +2159,29 @@ agentgit/
 │   │   ├── labels.ts            # Label state machine
 │   │   ├── transitions.ts       # State transition logic
 │   │   └── reconciler.ts        # Periodic state reconciliation
+│   ├── tasks/
+│   │   ├── runner.ts            # Task workflow runner: resolves phases, invokes skills
+│   │   ├── loader.ts            # Load task definitions (built-in + .agentGit/tasks/ overrides)
+│   │   ├── resolver.ts          # Resolve $-prefixed input references
+│   │   └── defaults/            # Built-in default task definitions
+│   │       ├── pre-plan.yml
+│   │       ├── plan.yml
+│   │       ├── build.yml
+│   │       └── post-build.yml
+│   ├── skills/
+│   │   ├── registry.ts          # Skill registry: discovers and loads skills
+│   │   ├── interface.ts         # Skill interface definition
+│   │   ├── loader.ts            # Load user-defined skills from .agentGit/skills/
+│   │   └── builtin/             # Built-in skill implementations
+│   │       ├── task-safety-checker.ts
+│   │       ├── issue-classifier.ts
+│   │       ├── plan-generator.ts
+│   │       ├── plan-executor.ts
+│   │       ├── workspace-setup.ts
+│   │       ├── pr-creator.ts
+│   │       ├── test-runner.ts
+│   │       ├── docs-checker.ts
+│   │       └── lint-runner.ts
 │   ├── harness/
 │   │   ├── interface.ts         # CodingHarness interface
 │   │   ├── opencode.ts          # OpenCode implementation
@@ -1454,11 +2198,12 @@ agentgit/
 │   │   ├── dispatcher.ts        # Job assignment to workers
 │   │   ├── attestation.ts       # Signed attestation verification
 │   │   └── patch-scanner.ts     # Secret pattern scanning for worker patches
-│   ├── sandbox/
-│   │   ├── docker.ts            # Docker sandbox management
-│   │   └── workspace.ts         # Ephemeral workspace setup
+│   ├── sandbox/                 # (Future - v0.2+, Docker/firejail sandbox)
+│   │   └── docker.ts            # Docker sandbox management
+│   ├── workspace/
+│   │   └── manager.ts           # Ephemeral per-issue workspace setup and cleanup
 │   ├── config/
-│   │   ├── loader.ts            # Load .github/agentgit.yml
+│   │   ├── loader.ts            # Load .agentGit/config.yml (with .github/agentgit.yml fallback)
 │   │   ├── schema.ts            # Config validation (including security settings)
 │   │   └── defaults.ts          # Default configuration
 │   ├── setup/
@@ -1475,16 +2220,22 @@ agentgit/
 │   ├── commands/
 │   ├── security/                # Safety checker and signing tests
 │   ├── state/
+│   ├── tasks/                   # Task runner, loader, resolver tests
+│   ├── skills/                  # Built-in skill tests
 │   ├── harness/
 │   ├── setup/                   # Setup CLI and doctor tests
 │   └── fixtures/
 ├── Documentation/
 │   └── plans/
 │       └── PLAN.md              # This file
+├── .agentGit/                   # Self-referential config for this repo
+│   ├── config.yml
+│   ├── tasks/                   # (empty unless overriding defaults)
+│   └── skills/                  # (empty unless adding custom skills)
 ├── .github/
-│   └── agentgit.yml             # Self-referential config for this repo
-├── Dockerfile                   # For deployment
-├── docker-compose.yml           # For local dev with sandbox
+│   └── agentgit.yml             # Backward-compatible config alias
+├── Dockerfile                   # For deployment (future: sandbox containers)
+├── docker-compose.yml           # For local dev (future: sandbox integration)
 ├── .env.example                 # Environment variable template (no secrets)
 ├── package.json
 ├── tsconfig.json
