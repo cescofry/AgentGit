@@ -38,15 +38,6 @@ function createMockOctokit(options?: {
                     metadata: "read",
                   }
                 : {},
-              events: opts.permissionsOk
-                ? [
-                    "issues",
-                    "issue_comment",
-                    "pull_request",
-                    "pull_request_review",
-                    "label",
-                  ]
-                : [],
             },
           }
         }),
@@ -72,7 +63,6 @@ describe("setup/doctor", () => {
   })
 
   it("all checks pass -> exit code 0", async () => {
-    // Mock Node version - already running so process.version is fine
     // Mock git version
     mockExecSync.mockImplementation((cmd: string) => {
       if (cmd === "git --version") return "git version 2.40.0" as any
@@ -84,7 +74,6 @@ describe("setup/doctor", () => {
     // Mock env vars
     const envBackup = { ...process.env }
     process.env.GITHUB_APP_ID = "123"
-    process.env.GITHUB_WEBHOOK_SECRET = "secret"
     process.env.AGENTGIT_SIGNING_SECRET = "sign-secret"
     process.env.GITHUB_APP_PRIVATE_KEY = "key"
 
@@ -104,6 +93,12 @@ describe("setup/doctor", () => {
     expect(result.totalFailed).toBe(0)
     expect(result.totalPassed).toBeGreaterThan(0)
 
+    // Should NOT check for webhook events
+    const appSection = result.sections.find((s) => s.name === "GitHub App")
+    expect(appSection).toBeDefined()
+    const webhookCheck = appSection!.checks.find((c) => c.name === "Webhook events")
+    expect(webhookCheck).toBeUndefined()
+
     // Restore env
     process.env = envBackup
   })
@@ -120,7 +115,6 @@ describe("setup/doctor", () => {
     // Mock env vars
     const envBackup = { ...process.env }
     process.env.GITHUB_APP_ID = "123"
-    process.env.GITHUB_WEBHOOK_SECRET = "secret"
     process.env.AGENTGIT_SIGNING_SECRET = "sign-secret"
     process.env.GITHUB_APP_PRIVATE_KEY = "key"
 
@@ -143,7 +137,6 @@ describe("setup/doctor", () => {
     // Missing env vars
     const envBackup = { ...process.env }
     delete process.env.GITHUB_APP_ID
-    delete process.env.GITHUB_WEBHOOK_SECRET
     delete process.env.AGENTGIT_SIGNING_SECRET
     delete process.env.GITHUB_APP_PRIVATE_KEY
     delete process.env.GITHUB_APP_PRIVATE_KEY_PATH
@@ -164,7 +157,6 @@ describe("setup/doctor", () => {
 
     const envBackup = { ...process.env }
     process.env.GITHUB_APP_ID = "123"
-    process.env.GITHUB_WEBHOOK_SECRET = "secret"
     process.env.AGENTGIT_SIGNING_SECRET = "sign-secret"
     process.env.GITHUB_APP_PRIVATE_KEY = "key"
 
@@ -187,7 +179,6 @@ describe("setup/doctor", () => {
 
     const envBackup = { ...process.env }
     process.env.GITHUB_APP_ID = "123"
-    process.env.GITHUB_WEBHOOK_SECRET = "secret"
     process.env.AGENTGIT_SIGNING_SECRET = "sign-secret"
     process.env.GITHUB_APP_PRIVATE_KEY = "key"
 
@@ -213,7 +204,6 @@ describe("setup/doctor", () => {
 
     const envBackup = { ...process.env }
     process.env.GITHUB_APP_ID = "123"
-    process.env.GITHUB_WEBHOOK_SECRET = "secret"
     process.env.AGENTGIT_SIGNING_SECRET = "sign-secret"
     process.env.GITHUB_APP_PRIVATE_KEY = "key"
 
@@ -238,7 +228,6 @@ describe("setup/doctor", () => {
 
     const envBackup = { ...process.env }
     process.env.GITHUB_APP_ID = "123"
-    process.env.GITHUB_WEBHOOK_SECRET = "secret"
     process.env.AGENTGIT_SIGNING_SECRET = "sign-secret"
     process.env.GITHUB_APP_PRIVATE_KEY = "key"
 

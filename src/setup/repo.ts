@@ -47,10 +47,7 @@ export async function setupRepo(options: {
     if (permResult.allPassed) {
       steps.push({ step: "Verify bot permissions", status: "ok" })
     } else {
-      const missing = [
-        ...permResult.permissions.filter((p) => p.status !== "ok"),
-        ...permResult.webhookEvents.filter((e) => e.status !== "ok"),
-      ]
+      const missing = permResult.permissions.filter((p) => p.status !== "ok")
       steps.push({
         step: "Verify bot permissions",
         status: "error",

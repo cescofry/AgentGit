@@ -18,8 +18,8 @@ import { parseMetadataComment } from "../utils/metadata"
 // ── Types ──
 
 /**
- * Minimal context interface that mirrors what Probot provides.
- * Keeps handlers testable without importing Probot directly.
+ * Minimal context interface for handler functions.
+ * Keeps handlers testable without tight coupling to a specific framework.
  */
 export interface HandlerContext {
   octokit: any
@@ -38,7 +38,7 @@ export interface HandlerDeps {
 // ── Helpers ──
 
 /**
- * Build an IssueContext from the webhook payload.
+ * Build an IssueContext from the GitHub API issue data.
  */
 export async function buildIssueContext(
   context: HandlerContext,

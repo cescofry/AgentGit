@@ -35,15 +35,6 @@ function createMockOctokit(options?: {
                     metadata: "read",
                   }
                 : {},
-              events: opts.permissionsOk
-                ? [
-                    "issues",
-                    "issue_comment",
-                    "pull_request",
-                    "pull_request_review",
-                    "label",
-                  ]
-                : [],
             },
           }
         }),

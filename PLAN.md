@@ -36,10 +36,10 @@ Build a system that:
 
 Requirements:
 
-- Deployed on a remote Linux server, available 24/7.
+- Deployed on a remote server (private, no public ports required), available 24/7.
 - Posts to GitHub as a bot (distinct from the human user).
 - Uses OpenCode as the agentic harness (Pi as a viable alternative).
-- Reacts to issue updates via webhooks or polls at intervals.
+- Reacts to issue updates via outbound polling of the GitHub API.
 - Configurable per-task instructions (bug fix vs. feature vs. UI replication).
 
 ---
@@ -69,13 +69,13 @@ Requirements:
 | Product | Stars | License | Notes |
 |---|---|---|---|
 | [PR-Agent](https://github.com/The-PR-Agent/pr-agent) | 11.5k | Apache-2.0 | PR reviewer, not issue-to-implementation. |
-| [Probot](https://github.com/probot/probot) | 9.6k | ISC | GitHub App framework in Node.js. Webhook handling, not AI. Ideal orchestrator. |
+| [Probot](https://github.com/probot/probot) | 9.6k | ISC | GitHub App framework in Node.js. Webhook handling, not AI. Was originally used as orchestrator; replaced with custom outbound-only polling controller to avoid exposing the server. |
 
 ### Key Findings
 
 - No open-source product implements the exact "admin-approved issue -> plan negotiation -> execute PR" loop.
 - OpenHands Resolver is closest but lacks the deliberate plan-review cycle.
-- The differentiator is the admin-gated plan workflow, per-task instruction profiles, and 24/7 orchestration.
+- The differentiator is the admin-gated plan workflow, per-task instruction profiles, outbound-only architecture, and 24/7 orchestration.
 
 ---
 
@@ -83,17 +83,20 @@ Requirements:
 
 ### Three-Layer Architecture
 
+> **Architecture Update (v0.1.1):** The orchestrator has been redesigned from a Probot webhook listener to an outbound-only polling controller. AgentGit no longer requires inbound webhooks, public ports, or an exposed server. The GitHub App identity is retained for bot identity, installation-scoped auth, and least-privilege permissions.
+
 ```
 +---------------------------+
-|   Layer 1: Orchestrator   |  Probot (GitHub App)
-|   - Webhook listener      |  - Receives issue/comment/label events
-|   - Command parser        |  - Validates admin identity
+|   Layer 1: Orchestrator   |  Polling Controller (GitHub App)
+|   - Outbound poller       |  - Scans repos via GitHub API
+|   - Command scanner       |  - Detects /agent comments
 |   - Label state machine   |  - Manages state transitions
 |   - Task workflow runner   |  - Executes tasks (phases -> skills)
-|   - Reconciler cron       |  - Recovers from missed webhooks
+|   - Stale recovery        |  - Recovers stuck issues
+|   - Command receipts      |  - Signed receipts for idempotency
 +---------------------------+
             |
-            v
+            v (outbound HTTPS only)
 +---------------------------+
 |   Layer 2: Harness        |  OpenCode (primary) / Pi (alternative)
 |   - Plan generation       |  - via CodingHarness interface
@@ -112,7 +115,7 @@ Requirements:
 
 ### Why This Split
 
-- **Probot** owns GitHub identity, webhook handling, command parsing, and task workflow execution. It resolves which tasks to run, loads their phase definitions, and invokes skills in order. It is mature (9.6k stars), well-documented, and purpose-built for GitHub Apps.
+- **Polling Controller** owns GitHub App identity, command scanning, state management, and task workflow execution. It resolves which tasks to run, loads their phase definitions, and invokes skills in order. It uses outbound-only HTTPS to the GitHub API -- no inbound webhooks, no public ports, no exposed servers. Multiple workers can poll the same repositories safely via signed command receipts.
 - **Skills** are the reusable units of work. Built-in skills handle safety checking, plan generation, code execution, test running, and PR creation. Users can add custom skills via `.agentGit/skills/`. Skills are invoked by the orchestrator through task phase definitions.
 - **OpenCode/Pi** owns the AI planning and coding. Swappable via interface. The harness is invoked by specific skills (e.g., `plan-generator`, `plan-executor`), not directly by the orchestrator.
 - **Execution Environment** provides ephemeral per-issue workspaces. In v0.1, this is a host directory on a dedicated server. Docker/firejail/microVM isolation is planned for v0.2+.
@@ -246,15 +249,17 @@ const result = await agent.run(planPrompt)
 
 ---
 
-## Orchestrator: Probot
+## Orchestrator: Polling Controller
 
-### Why Probot
+> **Architecture Update (v0.1.1):** Probot has been replaced with a custom outbound-only polling controller. The GitHub App identity is retained for bot identity and auth, but no inbound webhooks or public ports are needed.
 
-- Purpose-built TypeScript framework for GitHub Apps.
-- Handles webhook verification, authentication, rate limiting.
-- Event-driven: `app.on("issues.labeled", ...)`, `app.on("issue_comment.created", ...)`.
-- Mature (9.6k stars, 1k forks), well-documented.
-- Runs as a standard Node.js server on any Linux box.
+### Why Polling Over Webhooks
+
+- **No exposed server**: The AgentGit machine never needs a public IP, port, or domain name. It only makes outbound HTTPS requests to `api.github.com`.
+- **Multi-worker support**: Multiple AgentGit instances can poll the same repositories. Signed command receipts prevent duplicate processing.
+- **Firewall-friendly**: Works behind NAT, corporate firewalls, or in restricted environments.
+- **Simpler deployment**: No TLS certificates, reverse proxies, or DNS configuration needed.
+- **Resilient**: No missed events from webhook delivery failures. Every poll cycle scans current state.
 
 ### GitHub App Identity
 
@@ -262,12 +267,60 @@ Register a GitHub App (not a personal bot account):
 
 - Posts comments, creates branches, opens PRs as a distinct bot identity.
 - Granular permissions: issues (read/write), pull requests (read/write), contents (read/write).
-- Webhook subscriptions: `issues`, `issue_comment`, `pull_request`, `label`.
+- No webhook URL needed. Leave webhook configuration disabled or inactive.
 - Installation tokens (short-lived, per-repo) instead of long-lived PATs.
 
-### Probot Skeleton
+### Polling Loop
+
+The polling controller runs a periodic scan (default: every 30 seconds) across all installed repos:
 
 ```ts
+async function poll() {
+  const installations = await listInstallations()
+  for (const installation of installations) {
+    const repos = await listReposForInstallation(installation)
+    for (const repo of repos) {
+      // 1. Scan for new /agent command comments
+      await scanForUnprocessedCommands(repo)
+      // 2. Scan for issues with agent:ready label
+      await scanForReadyIssues(repo)
+      // 3. Scan for merged AgentGit PRs
+      await scanForMergedPrs(repo)
+      // 4. Scan for stale issues needing recovery
+      await scanForStaleIssues(repo)
+    }
+  }
+}
+
+setInterval(() => poll(), pollIntervalMs)
+```
+
+### Command Receipt System
+
+Each processed `/agent` command gets a signed receipt comment:
+
+```md
+<!-- agent-metadata
+{
+  "type": "processed-command",
+  "comment_id": 123456789,
+  "command": "approve",
+  "worker_id": "agentgit-worker-1",
+  "processed_at": "2026-06-07T12:00:00Z",
+  "signature": "hmac-sha256:..."
+}
+-->
+Command `approve` processed.
+```
+
+This enables idempotent polling: on each cycle, the poller skips commands that already have a receipt.
+
+### Event Processors
+
+> **Note:** The Probot skeleton below is retained for historical reference. The actual implementation uses reusable event processor functions (`processCommandComment`, `processReadyIssue`, `processMergedAgentPr`) invoked by the polling loop, not by webhook handlers.
+
+```ts
+// Historical reference -- original Probot skeleton
 import { Probot } from "probot"
 
 export default (app: Probot) => {
@@ -392,28 +445,23 @@ function parseCommand(body: string): Command | null {
 }
 ```
 
-### Reconciler Cron
+### Stale Issue Recovery
 
-A periodic job (every 5-15 minutes) scans for stale states:
+The polling controller includes stale issue recovery (previously called the "reconciler"). On each poll cycle, it scans for issues stuck in active states past a timeout threshold:
 
 ```ts
 // Pseudo-code
-async function reconcile(app: Probot) {
-  const repos = getInstalledRepos()
-  for (const repo of repos) {
-    const issues = await listIssuesWithLabel(repo, "agent:planning")
+async function scanForStaleIssues(repo) {
+  for (const label of ["agent:planning", "agent:working", "agent:approved"]) {
+    const issues = await listIssuesWithLabel(repo, label)
     for (const issue of issues) {
       const lastBotComment = await getLastBotComment(issue)
       if (isStale(lastBotComment, 30 * 60 * 1000)) {
-        // Planning started > 30 min ago with no result
-        await markBlocked(issue, "Planning timed out")
+        await markBlocked(issue, "Timed out -- no activity for 30 minutes")
       }
     }
-    // Similar checks for agent:working, agent:approved
   }
 }
-
-setInterval(() => reconcile(app), 10 * 60 * 1000) // every 10 min
 ```
 
 ---
@@ -509,21 +557,21 @@ Revocation updates the existing metadata comment by setting `revoked_at`.
 - Delegation is scoped to a single issue. It does not carry over to other issues.
 - Delegation can optionally expire (`expires_at` field).
 
-### Webhook Events
+### GitHub Events (Detected via Polling)
 
-| Event | Use |
+| Event | Detection Method |
 |---|---|
-| `issue_comment.created` | Parse `/agent` commands. |
-| `issues.labeled` | Detect `agent:ready` or type labels. |
-| `issues.unlabeled` | Detect manual state resets. |
-| `pull_request.closed` | Detect merged PRs to transition to `agent:done`. |
-| `pull_request_review` | Optionally react to PR review feedback. |
+| New `/agent` command | Scan issue comments for unprocessed commands (no receipt). |
+| `agent:ready` label added | Scan open issues with ready labels and no active agent state. |
+| PR merged | Scan recently closed PRs for bot-created PRs with signed metadata. |
+| Stale states | Scan issues in active states with no recent bot activity. |
 
-### Webhook vs. Polling
+### Polling Architecture
 
-- **Primary**: Webhooks via Probot (near real-time, low overhead).
-- **Fallback**: Reconciler cron every 5-15 minutes scans for missed events, stale states, stuck jobs.
-- **No pure polling needed** if webhooks are configured correctly, but the reconciler provides resilience.
+- **Primary**: Outbound polling via GitHub API (configurable interval, default 30s).
+- **Idempotency**: Signed command receipts prevent duplicate processing across poll cycles and workers.
+- **Resilience**: Every poll cycle scans current state. No events can be "missed" since the poller reads from GitHub's source of truth.
+- **Multi-worker**: Multiple AgentGit instances can safely poll the same repos.
 
 ---
 
@@ -624,9 +672,13 @@ The safety review prompt must treat issue content as data, not as instructions. 
 
 ### GitHub Authenticity & Trust Model
 
-#### Inbound Webhook Verification
+#### Outbound-Only Trust Model
 
-Probot verifies all incoming GitHub webhooks using `X-Hub-Signature-256` and the configured webhook secret. This ensures that webhook payloads genuinely originate from GitHub and have not been tampered with. A forged webhook from an external source will be rejected.
+AgentGit uses outbound-only HTTPS to the GitHub API. There are no inbound webhooks, so no webhook signature verification is needed. Trust is established through:
+
+1. **GitHub App installation tokens**: Short-lived, per-repo tokens authenticated via the App's private key.
+2. **HMAC-signed metadata comments**: All bot metadata is signed with a server-side secret.
+3. **Bot identity verification**: Comments are verified by checking `user.login` and `user.type` against the app slug.
 
 #### Outbound Bot Identity
 
@@ -1463,9 +1515,10 @@ This command runs inside a cloned repository and collects or verifies:
 | App ID | Prompted or env `GITHUB_APP_ID` | Numeric ID from the GitHub App settings page. |
 | Installation ID | Auto-discovered via API | The bot queries its installations and matches by repo owner. |
 | Private key path | Prompted or env `GITHUB_APP_PRIVATE_KEY_PATH` | Path to the `.pem` file. Never copied into the repo. |
-| Webhook secret | Prompted or env `GITHUB_WEBHOOK_SECRET` | Used by Probot for `X-Hub-Signature-256` verification. |
 
 The setup program validates the app credentials by making a test API call (e.g., `GET /app`) and confirms the installation has access to the target repository.
+
+> **Note:** No webhook URL or webhook secret is needed. AgentGit uses outbound polling.
 
 #### Bot Permissions Verification
 
@@ -1480,16 +1533,11 @@ The setup program verifies that the GitHub App installation has the required per
 
 If any permission is missing, the setup program prints the exact permission name and a link to the GitHub App settings page.
 
-#### Webhook Configuration
+#### Polling Configuration
 
-The setup program verifies or guides the user through:
+> **Note:** No webhook configuration is needed. AgentGit uses outbound polling.
 
-| Information | Source | Notes |
-|---|---|---|
-| Webhook URL | Prompted | The public URL where Probot receives events (e.g., `https://agentgit.example.com/api/webhooks`). |
-| Subscribed events | Validated via API | Must include: `issues`, `issue_comment`, `pull_request`, `pull_request_review`, `label`. |
-
-If events are missing, the setup program prints the required event list and a link to configure them.
+The setup program verifies outbound connectivity to the GitHub API and confirms the App installation has the required permissions.
 
 #### Label Provisioning
 
@@ -1564,10 +1612,10 @@ The setup program checks for required environment variables and generates a `.en
 |---|---|---|
 | `GITHUB_APP_ID` | Yes | GitHub App numeric ID. |
 | `GITHUB_APP_PRIVATE_KEY` or `GITHUB_APP_PRIVATE_KEY_PATH` | Yes | App authentication. Inline PEM or path to `.pem` file. |
-| `GITHUB_WEBHOOK_SECRET` | Yes | Webhook signature verification. |
 | `AGENTGIT_SIGNING_SECRET` | Yes | HMAC-SHA256 signing of metadata comments. |
-| `AGENTGIT_PORT` | No (default: `3000`) | Port for the Probot HTTP server. |
+| `AGENTGIT_POLL_INTERVAL_MS` | No (default: `30000`) | Polling interval in milliseconds. |
 | `AGENTGIT_LOG_LEVEL` | No (default: `info`) | Logging verbosity (`debug`, `info`, `warn`, `error`). |
+| `AGENTGIT_WORKER_ID` | No (auto-generated) | Unique ID for this worker instance. |
 | `OPENCODE_MODEL` | No | Override default LLM model for OpenCode harness. |
 | `ANTHROPIC_API_KEY` or `OPENAI_API_KEY` | Yes (one) | LLM provider API key for the coding harness. |
 
@@ -1577,13 +1625,12 @@ The setup program validates each secret by making a test call (GitHub API for ap
 
 | Prerequisite | Check | Notes |
 |---|---|---|
-| Node.js | `node --version` >= 18 | Required for Probot. |
+| Node.js | `node --version` >= 18 | Required for the polling controller. |
 | npm / pnpm | `npm --version` or `pnpm --version` | Package manager. |
 | Git | `git --version` >= 2.30 | Required for branch operations. |
 | OpenCode | `opencode --version` | Required if harness is `opencode`. |
 | Docker | `docker info` | Optional (v0.2+ sandbox). Not required for v0.1. |
 | Network access | HTTP probe to `api.github.com` | Confirms outbound connectivity to GitHub. |
-| Webhook reachability | Optional reverse probe | If a public URL is configured, attempts to confirm it is reachable (guidance only). |
 
 #### Generated Files
 
@@ -1614,7 +1661,6 @@ agentgit doctor
   [OK]  App ID: 123456
   [OK]  Installation found for octocat/my-project
   [OK]  Permissions: issues(rw), pull_requests(rw), contents(rw), metadata(r)
-  [OK]  Webhook events: issues, issue_comment, pull_request, pull_request_review, label
 
   Server Environment
   [OK]  Node.js v20.11.0
@@ -1623,15 +1669,13 @@ agentgit doctor
   [INFO] Docker not available (optional, for v0.2+ sandbox)
   [OK]  GITHUB_APP_ID set
   [OK]  GITHUB_APP_PRIVATE_KEY_PATH set (file exists, valid PEM)
-  [OK]  GITHUB_WEBHOOK_SECRET set
   [OK]  AGENTGIT_SIGNING_SECRET set
   [OK]  ANTHROPIC_API_KEY set (test call succeeded)
 
   Connectivity
   [OK]  api.github.com reachable
-  [WARN] Webhook URL reachability could not be verified (optional)
 
-  18/19 checks passed, 1 warning, 0 failures
+  17/17 checks passed, 0 warnings, 0 failures
 ```
 
 Exit codes: `0` = all checks passed, `1` = one or more failures, `2` = warnings only.
@@ -1649,7 +1693,6 @@ agentgit setup repo
     ├── Validate App ID + private key (test API call)
     ├── Discover installation ID for this repo
     ├── Verify bot permissions (issues, PRs, contents, metadata)
-    ├── Verify webhook event subscriptions
     ├── Create missing agent:* labels
     ├── Generate .agentGit/ directory (config.yml, tasks/, skills/)
     └── Print summary + next steps
@@ -1676,8 +1719,8 @@ agentgit doctor  (anytime, to verify health)
 
 | Area | Notes |
 |---|---|
-| GitHub App / Probot | Well-documented, mature framework. Straightforward. |
-| Webhook handling | Standard Probot capability. Webhook signature verification is built-in. |
+| GitHub App | Well-documented. GitHub App identity for bot comments, PRs, and permissions. |
+| Polling controller | Outbound-only design. No public ports, no webhook configuration needed. |
 | Label-based state | GitHub API supports label CRUD. No DB needed. |
 | Bot comments | GitHub API supports creating/editing comments. |
 | OpenCode headless | `opencode run` and SDK are documented and functional. |
@@ -1691,10 +1734,10 @@ agentgit doctor  (anytime, to verify health)
 |---|---|---|
 | Safe execution | Agent runs arbitrary repo commands | Dedicated server/user, ephemeral workspaces, no long-lived creds, minimal env exposure. Docker sandbox planned for v0.2+. |
 | Plan quality | LLM may produce poor plans | Admin review loop, max revision limit, confidence scoring. |
-| Concurrency | Two webhooks for same issue | Label-based idempotent claiming, single-instance deployment for MVP. |
+| Concurrency | Two poll cycles process same command | Signed command receipts for idempotent processing. Multiple workers safe. |
 | Cost control | LLM calls can be expensive | Max runtime, max iterations, per-issue budget tracking in comments. |
 | Prompt injection | Issue text is untrusted | Treat issue body as task input, not system instruction. Keep bot policy outside issue content. Pre-plan safety gate catches malicious intent before agent runs. |
-| State sync | Missed webhooks | Reconciler cron every 5-15 minutes. |
+| State sync | Stale or stuck issues | Polling loop includes stale issue recovery. No events to miss. |
 | Safety review accuracy | LLM safety classifier may produce false positives/negatives | Combine deterministic pattern rules with LLM scan. Admin can unlock false positives. Conservative default (lock on uncertain). |
 | Metadata spoofing | User could create comments mimicking bot metadata format | Verify comment author is app bot + HMAC signature validation. |
 
@@ -1722,11 +1765,11 @@ For an early visible demo, build these phases first: 0, 1, 2, 3, 8, 11. This pro
 
 ### Phase 0: Project Scaffold
 
-**Goal**: Runnable TypeScript/Probot project with test infrastructure.
+**Goal**: Runnable TypeScript project with test infrastructure.
 
 **Build**:
 - `package.json`, `tsconfig.json`, ESLint config, test runner setup (Vitest or Jest).
-- `src/index.ts` -- Probot app entrypoint that loads and starts.
+- `src/index.ts` -- Polling app entrypoint with event processors.
 - Basic environment variable loader and validation.
 - Structured logger utility.
 
@@ -1735,7 +1778,7 @@ For an early visible demo, build these phases first: 0, 1, 2, 3, 8, 11. This pro
 - App loads without crashing with mocked environment.
 - Env validation rejects missing required GitHub App variables.
 
-**Acceptance**: `npm test` passes. Local Probot app can start with mocked config and respond to a health-check endpoint.
+**Acceptance**: `npm test` passes. App can start with mocked config.
 
 ### Phase 1: Command Parser + Authorization
 
@@ -1949,45 +1992,46 @@ For an early visible demo, build these phases first: 0, 1, 2, 3, 8, 11. This pro
 
 **Acceptance**: No PR is opened unless all required validation phases pass. PR metadata is signed and verifiable.
 
-### Phase 11: Webhook Integration End-to-End
+### Phase 11: Polling Integration End-to-End
 
-**Goal**: Wire commands, labels, task runner, and state transitions into live webhook handlers.
+**Goal**: Wire commands, labels, task runner, and state transitions into the polling loop event processors.
 
 **Build**:
-- `issue_comment.created` webhook handler: parse command, authorize, dispatch.
-- `issues.labeled` webhook handler: detect `agent:ready`, trigger flow.
-- `pull_request.closed` webhook handler: detect merge, transition to `agent:done`.
+- `processCommandComment` event processor: scan comments, parse command, authorize, dispatch.
+- `processReadyIssue` event processor: detect `agent:ready`, trigger flow.
+- `processMergedAgentPr` event processor: detect merge, transition to `agent:done`.
 - Command dispatchers for all MVP commands.
 - Issue context loader: fetch issue title, body, comments, labels from GitHub API.
 - Bot response comments: status updates, error messages, progress indicators.
+- Signed command receipts for idempotent polling.
 
 **Test**:
-- Webhook fixture for `/agent plan` drives full mocked flow: security review -> planning -> plan posted.
-- Webhook fixture for `/agent approve` drives: approved -> working -> post-build -> PR opened.
+- Polling fixture for `/agent plan` drives full mocked flow: security review -> planning -> plan posted.
+- Polling fixture for `/agent approve` drives: approved -> working -> post-build -> PR opened.
 - Unauthorized command produces rejection comment.
 - `/agent stop` from any active state transitions to `agent:cancelled`.
 - `/agent status` returns current state summary.
 
-**Acceptance**: Mocked GitHub webhooks drive the full issue lifecycle from `/agent plan` through `agent:pr-opened`.
+**Acceptance**: Mocked polling drives the full issue lifecycle from `/agent plan` through `agent:pr-opened`.
 
-### Phase 12: Reconciler
+### Phase 12: Poller / Stale Recovery
 
-**Goal**: Recover from missed webhooks and stuck states.
+**Goal**: Recover from stuck states via the polling loop.
 
 **Build**:
 - Installed repo scanner: list all repos with active AgentGit installations.
 - Stale state detection: find issues in `agent:planning`, `agent:working`, or `agent:approved` where the last bot comment is older than `max_runtime_minutes`.
 - Timeout handler: transition stale issues to `agent:blocked` with explanation comment.
-- Idempotent reconciliation: skip issues that are already being handled or have recent activity.
-- Periodic cron: `setInterval` every 10 minutes.
+- Idempotent recovery: skip issues that are already being handled or have recent activity.
+- Integrated into the main polling loop (no separate cron needed).
 
 **Test**:
 - Stale `agent:planning` issue (last bot comment > 30 min ago) transitions to `agent:blocked`.
 - Fresh `agent:planning` issue (recent bot comment) is skipped.
-- Repeated reconcile runs do not produce duplicate comments.
+- Repeated poll runs do not produce duplicate comments.
 - `agent:blocked` issues are not re-blocked.
 
-**Acceptance**: Process restart or missed webhook does not permanently strand issues. Reconciler recovers stuck states within one cron interval.
+**Acceptance**: Stuck issues are recovered within one poll interval.
 
 ### Phase 13: Setup CLI + Doctor
 
@@ -2052,7 +2096,7 @@ Phase 6: Task Runner + Skills <────────────────�
 Phase 7: Safety Gate   Phase 8: Planning Flow
     |                  |
     v                  v
-    └──────> Phase 11: Webhook Integration <──────┐
+    └──────> Phase 11: Polling Integration <──────┐
                   |                               |
                   v                               |
              Phase 9: Workspace + Build           |
@@ -2061,7 +2105,7 @@ Phase 7: Safety Gate   Phase 8: Planning Flow
              Phase 10: Post-Build + PR ───────────┘
                   |
                   v
-             Phase 12: Reconciler
+             Phase 12: Poller / Stale Recovery
                   |
                   v
              Phase 13: Setup CLI
@@ -2076,8 +2120,9 @@ Phase 7: Safety Gate   Phase 8: Planning Flow
 
 ### In Scope (v0.1)
 
-- [ ] Probot-based GitHub App, deployed on a single Linux server.
-- [ ] Webhook listener for `issue_comment.created` and `issues.labeled`.
+- [ ] Outbound-only polling GitHub App, deployable on any private server (no public ports required).
+- [ ] Polling controller scans for `/agent` commands, ready labels, merged PRs, and stale issues.
+- [ ] Signed command receipts for idempotent multi-worker polling.
 - [ ] Command parser for `/agent plan`, `/agent approve`, `/agent revise`, `/agent run`, `/agent stop`, `/agent retry`, `/agent delegate`, `/agent undelegate`, `/agent delegates`, `/agent status`, `/agent unlock-security`, `/agent close-unsafe`, `/agent security-status`.
 - [ ] Permission-based authorization using GitHub collaborator permission API.
 - [ ] Issue-scoped delegation via `/agent delegate` with metadata comment storage.
@@ -2099,7 +2144,7 @@ Phase 7: Safety Gate   Phase 8: Planning Flow
 - [ ] PR provenance verification (author, branch prefix, signed metadata).
 - [ ] Per-repo `.agentGit/config.yml` config with `.github/agentgit.yml` fallback.
 - [ ] Ephemeral per-issue workspaces on host (dedicated server, no Docker in v0.1).
-- [ ] Reconciler cron (every 10 minutes).
+- [ ] Stale issue recovery integrated into polling loop.
 - [ ] Setup CLI (`agentgit setup repo`, `agentgit setup server`, `agentgit doctor`) for interactive initialization, `.agentGit/` scaffolding, label provisioning, config generation, and health checks.
 
 ### Out of Scope (v0.2+)
@@ -2127,12 +2172,12 @@ Phase 7: Safety Gate   Phase 8: Planning Flow
 
 | Component | Technology |
 |---|---|
-| Orchestrator | Probot (TypeScript, Node.js) |
+| Orchestrator | Polling Controller (TypeScript, Node.js, GitHub App) |
 | Task runner | Built-in task workflow engine (YAML task definitions, skill phases) |
 | Coding harness | OpenCode (`opencode run` / SDK), invoked by skills |
 | Execution environment | Ephemeral host workspaces (Docker sandbox in v0.2+) |
 | State store | GitHub labels + comments (no DB) |
-| Deployment | Single Linux server, systemd service |
+| Deployment | Any server (private, no public ports), systemd service |
 | Config | `.agentGit/` directory per repo (config, tasks, skills) |
 
 ### Directory Structure (Proposed)
@@ -2140,7 +2185,7 @@ Phase 7: Safety Gate   Phase 8: Planning Flow
 ```
 agentgit/
 ├── src/
-│   ├── index.ts                 # Probot app entry
+│   ├── index.ts                 # Polling app entry + event processors
 │   ├── commands/
 │   │   ├── parser.ts            # Parse /agent commands from comments
 │   │   ├── plan.ts              # Handle /agent plan
@@ -2158,7 +2203,7 @@ agentgit/
 │   ├── state/
 │   │   ├── labels.ts            # Label state machine
 │   │   ├── transitions.ts       # State transition logic
-│   │   └── reconciler.ts        # Periodic state reconciliation
+│   │   └── reconciler.ts        # Polling controller + stale state recovery
 │   ├── tasks/
 │   │   ├── runner.ts            # Task workflow runner: resolves phases, invokes skills
 │   │   ├── loader.ts            # Load task definitions (built-in + .agentGit/tasks/ overrides)
@@ -2211,7 +2256,7 @@ agentgit/
 │   │   ├── server.ts            # `agentgit setup server` -- env validation, prerequisites
 │   │   ├── doctor.ts            # `agentgit doctor` -- health check runner
 │   │   ├── labels.ts            # Label provisioning (create missing agent:* labels)
-│   │   ├── permissions.ts       # Verify GitHub App permissions and webhook events
+│   │   ├── permissions.ts       # Verify GitHub App permissions
 │   │   └── prompts.ts           # Interactive prompts for setup wizard
 │   └── utils/
 │       ├── metadata.ts          # Parse/write HTML metadata comments

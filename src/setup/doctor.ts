@@ -181,11 +181,8 @@ export async function runDoctor(options: {
       )
       if (permResult.allPassed) {
         appChecks.push({ name: "App permissions", status: "ok" })
-        appChecks.push({ name: "Webhook events", status: "ok" })
       } else {
         const missingPerms = permResult.permissions.filter((p) => p.status !== "ok")
-        const missingEvents = permResult.webhookEvents.filter((e) => e.status !== "ok")
-
         if (missingPerms.length > 0) {
           appChecks.push({
             name: "App permissions",
@@ -194,16 +191,6 @@ export async function runDoctor(options: {
           })
         } else {
           appChecks.push({ name: "App permissions", status: "ok" })
-        }
-
-        if (missingEvents.length > 0) {
-          appChecks.push({
-            name: "Webhook events",
-            status: "error",
-            details: `Missing: ${missingEvents.map((e) => e.name).join(", ")}`,
-          })
-        } else {
-          appChecks.push({ name: "Webhook events", status: "ok" })
         }
       }
     } catch (err: any) {

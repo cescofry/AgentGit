@@ -2,7 +2,7 @@
 
 A GitHub bot that watches repositories for issues, proposes AI-generated implementation plans, iterates with maintainers, and opens pull requests -- all driven by `/agent` commands in issue comments.
 
-AgentGit runs as a [Probot](https://probot.github.io/) GitHub App on a dedicated server. It uses [OpenCode](https://github.com/anomalyco/opencode) as the AI coding harness for plan generation and code execution. All state is stored in GitHub labels and comments -- no external database required.
+AgentGit runs as an outbound-only polling service using a [GitHub App](https://docs.github.com/en/apps/creating-github-apps) identity. It uses [OpenCode](https://github.com/anomalyco/opencode) as the AI coding harness for plan generation and code execution. All state is stored in GitHub labels and comments -- no external database required. **No inbound webhooks, no public ports, no exposed servers.**
 
 ## Table of Contents
 
@@ -24,20 +24,20 @@ AgentGit runs as a [Probot](https://probot.github.io/) GitHub App on a dedicated
 
 1. A maintainer creates a GitHub issue describing a bug, feature, or task.
 2. The maintainer comments `/agent plan` (or adds the `agent:ready` label).
-3. AgentGit runs a **safety review** on the issue content to catch malicious requests.
+3. AgentGit's polling loop picks up the command and runs a **safety review** on the issue content.
 4. If safe, AgentGit **classifies the issue** and **generates an implementation plan** using the AI harness.
 5. The plan is posted as a signed comment on the issue for review.
 6. The maintainer reviews the plan and either:
    - Comments `/agent approve` to proceed.
    - Comments `/agent revise <feedback>` to request changes.
 7. Once approved, AgentGit **clones the repo**, **executes the plan**, **runs tests**, and **opens a PR** linked to the issue.
-8. When the PR is merged, the issue is automatically marked as done.
+8. When the PR is merged, the poller detects it and marks the issue as done.
 
 ```
 Issue Created
     |
     v
-/agent plan  ──>  Safety Review  ──>  Plan Generation  ──>  Plan Posted
+/agent plan  -->  Safety Review  -->  Plan Generation  -->  Plan Posted
                        |                                         |
                    (unsafe)                              /agent approve
                        |                                         |
@@ -52,11 +52,18 @@ Issue Created
 
 ## Architecture
 
-AgentGit uses a three-layer architecture:
+AgentGit uses a three-layer architecture with an **outbound-only** design. The AgentGit process never exposes a public port or receives inbound connections. It polls the GitHub API for new activity.
 
-### Layer 1: Orchestrator (Probot)
+### Layer 1: Polling Controller
 
-The Probot GitHub App handles webhook events, command parsing, authorization, and state management. It receives `issue_comment.created`, `issues.labeled`, and `pull_request.closed` events from GitHub.
+The polling controller periodically scans all installed repositories for actionable state:
+
+- **New commands**: Unprocessed `/agent` comments on open issues.
+- **Ready issues**: Issues with `agent:ready` label that haven't been started.
+- **Merged PRs**: PRs created by AgentGit that were merged (to transition issues to done).
+- **Stale issues**: Issues stuck in active states (planning, working) past a timeout threshold.
+
+Each processed command gets a signed receipt comment to prevent duplicate processing across poll cycles or multiple workers.
 
 ### Layer 2: Task Engine
 
@@ -212,118 +219,42 @@ Admins and maintainers can delegate issue-scoped permissions to other users:
 
 ### Metadata Signing
 
-All bot metadata comments (plans, delegations, security locks) are signed with HMAC-SHA256 using a server-side secret. The bot verifies:
+All bot metadata comments (plans, delegations, security locks, command receipts) are signed with HMAC-SHA256 using a server-side secret. The bot verifies:
 
 1. Comment author is the app bot (`<app-slug>[bot]` with `type: "Bot"`).
 2. HMAC signature in the metadata matches a fresh computation.
 
 This prevents spoofing of bot metadata by regular users.
 
+### Command Receipt System
+
+Each processed `/agent` command gets a signed receipt comment to prevent duplicate processing. This enables:
+
+- **Idempotent polling**: Multiple poll cycles safely skip already-processed commands.
+- **Multi-worker safety**: Multiple AgentGit instances can poll the same repos without duplicating work.
+
 ---
 
 ## Task Workflow System
 
-### Skills
+Tasks are defined in YAML files under `.agentGit/tasks/` (or the built-in defaults). Each task has ordered phases, each phase invokes a registered skill.
 
-Skills are the smallest unit of work. Each implements the `Skill` interface:
-
-```ts
-interface Skill {
-  name: string
-  description: string
-  execute(input: SkillInput, context: ExecutionContext): Promise<SkillResult>
-}
-```
-
-#### Built-in Skills (9)
-
-| Skill | Task | Purpose |
-|---|---|---|
-| `task-safety-checker` | pre-plan | Scan issue for malicious patterns. |
-| `issue-classifier` | plan | Classify issue type from labels and content. |
-| `plan-generator` | plan | Generate implementation plan via coding harness. |
-| `workspace-setup` | build | Clone repo into ephemeral workspace, create branch. |
-| `plan-executor` | build | Execute approved plan via coding harness. |
-| `test-runner` | post-build | Run test suite (auto-detect or explicit command). |
-| `docs-checker` | post-build | Check if docs need updating. |
-| `lint-runner` | post-build | Run linting/formatting checks. |
-| `pr-creator` | post-build | Commit, push, and prepare PR data. |
-
-### Task Definitions
-
-Tasks are YAML files defining ordered phases. Each phase references a skill and defines inputs, failure behavior, and whether it's required.
-
-Example (`pre-plan.yml`):
-
-```yaml
-name: pre-plan
-description: Gate work before planning.
-
-phases:
-  - name: safety-review
-    skill: task-safety-checker
-    inputs:
-      issue_context: $issue
-      disallowed_categories: $config.security.disallowed_categories
-    on_failure: lock-security
-    required: true
-```
-
-### Phase Failure Modes
-
-| `on_failure` | Behavior |
-|---|---|
-| `block` | Stop execution, transition to `agent:blocked`. |
-| `lock-security` | Stop execution, transition to `agent:locked-security`. |
-| `warn` | Log warning, continue to next phase. |
-| `skip` | Silently continue. |
-
-### Input Resolution
-
-Phase inputs use `$`-prefixed references resolved at runtime:
-
-| Reference | Resolves To |
-|---|---|
-| `$issue` | Full issue context (number, title, body, comments, labels). |
-| `$config` | Repository configuration. |
-| `$config.execution.harness` | Nested config value. |
-| `$plan` | Approved plan text. |
-| `$phases.NAME.result` | Result data from a prior phase. |
-| `$phases.NAME.result.FIELD` | Specific field from a prior phase result. |
-
-### User Overrides
-
-Users can override any default task by placing a file with the same name in `.agentGit/tasks/`. Custom skills can be added in `.agentGit/skills/`.
+See the `src/tasks/defaults/` directory for the built-in task definitions.
 
 ---
 
 ## Configuration
 
-### Directory Structure
-
-```
-.agentGit/
-  config.yml           # Main configuration
-  tasks/               # Task overrides (optional)
-  skills/              # Custom skills (optional)
-```
-
-Fallback: `.github/agentgit.yml` is also supported.
-
-### Configuration Reference
+### Repository Config (`.agentGit/config.yml`)
 
 ```yaml
-# .agentGit/config.yml
-
 enabled: true
 
 ready_labels:
   - agent:ready
 
 approval:
-  required_permissions:
-    - admin
-    - maintain
+  required_permissions: [admin, maintain]
   allowed_users: []
   delegation:
     enabled: true
@@ -345,18 +276,8 @@ security:
     - policy_bypass
     - destructive_change
 
-task_types:
-  bug:
-    labels: [bug, agent:type:bug]
-  feature:
-    labels: [enhancement, agent:type:feature]
-  docs:
-    labels: [documentation, agent:type:docs]
-  ui:
-    labels: [ui, agent:type:ui]
-
 execution:
-  harness: opencode               # or "pi"
+  harness: opencode
   model: anthropic/claude-sonnet-4-20250514
   plan_model: anthropic/claude-sonnet-4-20250514
   test_command: auto              # "auto" = let agent decide
@@ -377,10 +298,10 @@ execution_environment:
 |---|---|---|---|
 | `GITHUB_APP_ID` | Yes | -- | GitHub App numeric ID. |
 | `GITHUB_APP_PRIVATE_KEY` or `GITHUB_APP_PRIVATE_KEY_PATH` | Yes | -- | App authentication key. |
-| `GITHUB_WEBHOOK_SECRET` | Yes | -- | Webhook signature verification. |
 | `AGENTGIT_SIGNING_SECRET` | Yes | -- | HMAC signing of metadata comments. |
-| `AGENTGIT_PORT` | No | `3000` | HTTP server port. |
+| `AGENTGIT_POLL_INTERVAL_MS` | No | `30000` | Polling interval in milliseconds. |
 | `AGENTGIT_LOG_LEVEL` | No | `info` | Log verbosity (`debug`, `info`, `warn`, `error`). |
+| `AGENTGIT_WORKER_ID` | No | auto | Unique ID for this worker instance. |
 | `GITHUB_APP_SLUG` | No | `agentgit` | App slug for bot identity checks. |
 | `ANTHROPIC_API_KEY` or `OPENAI_API_KEY` | Yes (one) | -- | LLM provider API key. |
 
@@ -408,14 +329,7 @@ Go to [github.com/settings/apps](https://github.com/settings/apps) and create a 
 | Contents | Read & Write |
 | Metadata | Read |
 
-**Webhook events:**
-- `issues`
-- `issue_comment`
-- `pull_request`
-- `pull_request_review`
-- `label`
-
-Set the webhook URL to `https://<your-server>:3000/api/github/webhooks`.
+**Important:** No webhook URL is needed. AgentGit uses outbound polling, not inbound webhooks. You can leave the webhook URL blank or set it to a placeholder. Uncheck "Active" under the Webhook section if GitHub requires a URL.
 
 Generate and download a private key (`.pem` file).
 
@@ -438,7 +352,6 @@ Edit `.env` with your credentials:
 ```env
 GITHUB_APP_ID=123456
 GITHUB_APP_PRIVATE_KEY_PATH=/path/to/private-key.pem
-GITHUB_WEBHOOK_SECRET=your-webhook-secret
 AGENTGIT_SIGNING_SECRET=a-long-random-secret-for-hmac
 ANTHROPIC_API_KEY=sk-ant-...
 ```
@@ -461,7 +374,7 @@ Or manually:
 npm run doctor
 ```
 
-### 5. Start the Server
+### 5. Start the Polling Service
 
 ```bash
 # Development
@@ -471,6 +384,8 @@ npm run dev
 npm run build
 npm start
 ```
+
+AgentGit will start polling all installed repositories for `/agent` commands. No public port is opened -- the service only makes outbound HTTPS requests to the GitHub API.
 
 ### 6. Verify
 
@@ -486,13 +401,20 @@ Expected output:
   [+] Git v2.x.x
   [+] GITHUB_APP_ID set
   [+] GITHUB_APP_PRIVATE_KEY_PATH set
-  [+] GITHUB_WEBHOOK_SECRET set
   [+] AGENTGIT_SIGNING_SECRET set
 
   Repository
   [+] .agentGit/config.yml exists
 
   18/18 checks passed, 0 warnings, 0 failures
+```
+
+### Multiple Workers
+
+AgentGit supports running multiple worker instances polling the same repositories. Each worker uses signed command receipts to avoid duplicate processing. Set a unique `AGENTGIT_WORKER_ID` for each instance:
+
+```env
+AGENTGIT_WORKER_ID=worker-1
 ```
 
 ---
@@ -508,12 +430,12 @@ Expected output:
 | `npm run build` | Compile TypeScript to `dist/`. |
 | `npm run typecheck` | Check types without emitting. |
 | `npm run lint` | Run ESLint on `src/` and `tests/`. |
-| `npm run dev` | Start the server with ts-node. |
+| `npm run dev` | Start the polling service with ts-node. |
 | `npm run doctor` | Run health checks. |
 
 ### Test Suite
 
-The project has **715 tests** across **39 test files**, covering:
+The project has **708 tests** across **39 test files**, covering:
 
 - Command parsing (42 tests)
 - Authorization and permissions (43 tests)
@@ -526,9 +448,9 @@ The project has **715 tests** across **39 test files**, covering:
 - Safety rules and checker (71 tests)
 - All 9 built-in skills (89 tests)
 - OpenCode harness (31 tests)
-- Webhook integration (34 tests)
-- Reconciler (21 tests)
-- Setup CLI and doctor (28 tests)
+- Polling integration (34 tests)
+- Poller / stale recovery (12 tests)
+- Setup CLI and doctor (21 tests)
 - End-to-end smoke test (27 tests)
 - GitHub API helpers (35 tests)
 
@@ -536,7 +458,7 @@ The project has **715 tests** across **39 test files**, covering:
 npm test
 
 # Test Files  39 passed (39)
-#      Tests  715 passed (715)
+#      Tests  708 passed (708)
 ```
 
 ---
@@ -546,7 +468,7 @@ npm test
 ```
 agentgit/
   src/
-    index.ts                      # Probot app entrypoint
+    index.ts                      # Polling app entrypoint + event processors
     commands/
       parser.ts                   # /agent command parser
       handlers.ts                 # Command handler implementations
@@ -592,7 +514,7 @@ agentgit/
     state/
       labels.ts                   # 18 label definitions
       manager.ts                  # State manager (GitHub API label operations)
-      reconciler.ts               # Periodic stale state recovery
+      reconciler.ts               # Polling controller + stale state recovery
       transitions.ts              # State machine (37 transitions)
     tasks/
       defaults/
@@ -609,7 +531,7 @@ agentgit/
       metadata.ts                 # HTML metadata comment parser/writer
     workspace/
       manager.ts                  # Ephemeral workspace creation/cleanup
-  tests/                          # 39 test files, 715 tests
+  tests/                          # 39 test files, 708 tests
   .agentGit/                      # Self-referential config directory
     config.yml
     tasks/
@@ -639,8 +561,8 @@ All 15 build phases from the PLAN.md are complete:
 | 8 | Planning Flow | Done |
 | 9 | Workspace + Build Execution | Done |
 | 10 | Post-Build Validation + PR Creation | Done |
-| 11 | Webhook Integration End-to-End | Done |
-| 12 | Reconciler | Done |
+| 11 | Polling Integration End-to-End | Done |
+| 12 | Poller / Stale Recovery | Done |
 | 13 | Setup CLI + Doctor | Done |
 | 14 | Smoke Test | Done |
 
@@ -650,7 +572,7 @@ All 15 build phases from the PLAN.md are complete:
 - Pi harness implementation
 - PR self-review before notifying admin
 - Cost tracking and per-issue budgets
-- Multi-replica deployment with distributed locking
+- Distributed worker coordination with lease-based locking
 - Distributed worker model (donated servers)
 - Slack/Discord notifications
 - Auto-retry on transient failures

@@ -1,4 +1,3 @@
-import { Probot } from "probot"
 import dotenv from "dotenv"
 
 import { parseCommand } from "./commands/parser"
@@ -25,7 +24,7 @@ import { isAuthorized, AuthorizationContext } from "./github/auth"
 import { getActiveDelegations } from "./github/delegation"
 import { createStatusComment } from "./github/comments"
 import { verifyPrProvenance } from "./github/pull-requests"
-import { parseMetadataComment } from "./utils/metadata"
+import { parseMetadataComment, hasMetadata, createMetadataComment } from "./utils/metadata"
 import { createStateManager } from "./state/manager"
 import { loadConfig } from "./config/loader"
 import { createSkillRegistry } from "./skills/registry"
@@ -39,10 +38,217 @@ import { TestRunnerSkill } from "./skills/builtin/test-runner"
 import { DocsCheckerSkill } from "./skills/builtin/docs-checker"
 import { LintRunnerSkill } from "./skills/builtin/lint-runner"
 import { PrCreatorSkill } from "./skills/builtin/pr-creator"
+import { createPoller, Poller } from "./state/reconciler"
 
 dotenv.config()
 
-export default function agentGitApp(app: Probot): void {
+// ── Reusable event processors ──
+
+/**
+ * Process a single issue comment that may contain an /agent command.
+ * Extracted from the old Probot webhook handler so it can be invoked
+ * from the polling loop or any other driver.
+ */
+export async function processCommandComment(
+  octokit: any,
+  owner: string,
+  repo: string,
+  issue: any,
+  comment: { id: number; body: string; user: { login: string; type: string } },
+  deps: HandlerDeps,
+): Promise<boolean> {
+  const command = parseCommand(comment.body)
+  if (!command) return false
+
+  const { config } = await loadConfig(octokit, owner, repo)
+  if (!config.enabled) return false
+
+  const handlerCtx: HandlerContext = {
+    octokit,
+    repo: () => ({ owner, repo }),
+    issue: (data?: any) => ({ owner, repo, issue_number: issue.number, ...data }),
+  }
+
+  // Build auth context
+  const authContext: AuthorizationContext = {
+    senderLogin: comment.user.login,
+    repoOwner: owner,
+    repoName: repo,
+    issueNumber: issue.number,
+    requiredPermissions: config.approval.required_permissions as any,
+    allowedUsers: config.approval.allowed_users,
+    securityAdmins: config.security.security_admins,
+    minDelegatePermission: config.approval.delegation.min_delegate_permission as any,
+  }
+
+  // Check authorization (with delegation support)
+  const getDelegations = async (issueNum: number) => {
+    const comments = await octokit.issues.listComments({
+      owner,
+      repo,
+      issue_number: issueNum,
+    })
+    const delegations = getActiveDelegations(
+      comments.data.map((c: any) => ({
+        user: { login: c.user!.login, type: c.user!.type },
+        body: c.body || "",
+      })),
+      deps.appSlug,
+      deps.signingSecret,
+      issueNum,
+    )
+    return delegations.map((d) => ({
+      username: d.delegated_to,
+      command: d.scopes.includes(command.action) ? command.action : "",
+    }))
+  }
+
+  const authResult = await isAuthorized(
+    octokit,
+    command.action,
+    authContext,
+    getDelegations,
+  )
+  if (!authResult.authorized) {
+    await octokit.issues.createComment({
+      owner,
+      repo,
+      issue_number: issue.number,
+      body: `@${comment.user.login} ${authResult.reason}`,
+    })
+    return true // processed but rejected
+  }
+
+  deps.logger.info(`Dispatching command: ${command.action}`, {
+    sender: comment.user.login,
+    issue: issue.number,
+    repo: `${owner}/${repo}`,
+  })
+
+  switch (command.action) {
+    case "plan":
+      await handlePlan(handlerCtx, config, deps, issue)
+      break
+    case "approve":
+      await handleApprove(handlerCtx, config, deps, issue, comment.user.login)
+      break
+    case "revise":
+      await handleRevise(handlerCtx, config, deps, issue, command.args)
+      break
+    case "run":
+      await handleRun(handlerCtx, config, deps, issue, comment.user.login)
+      break
+    case "stop":
+      await handleStop(handlerCtx, deps, comment.user.login)
+      break
+    case "retry":
+      await handleRetry(handlerCtx, config, deps, issue)
+      break
+    case "status":
+      await handleStatus(handlerCtx, deps)
+      break
+    case "delegate":
+      await handleDelegate(handlerCtx, deps, command.args, comment.user.login, issue)
+      break
+    case "undelegate":
+      await handleUndelegate(handlerCtx, deps, command.args, comment.user.login, issue)
+      break
+    case "delegates":
+      await handleListDelegates(handlerCtx, deps, issue)
+      break
+    case "unlock-security":
+      await handleUnlockSecurity(handlerCtx, deps, config, issue, comment.user.login)
+      break
+    case "close-unsafe":
+      await handleCloseUnsafe(handlerCtx, deps, comment.user.login)
+      break
+    case "security-status":
+      await handleSecurityStatus(handlerCtx, deps)
+      break
+    default:
+      deps.logger.warn(`Unknown command action: ${command.action}`)
+  }
+
+  return true
+}
+
+/**
+ * Process a ready-label issue (equivalent to the old issues.labeled webhook).
+ */
+export async function processReadyIssue(
+  octokit: any,
+  owner: string,
+  repo: string,
+  issue: any,
+  deps: HandlerDeps,
+  config: any,
+): Promise<void> {
+  const handlerCtx: HandlerContext = {
+    octokit,
+    repo: () => ({ owner, repo }),
+    issue: (data?: any) => ({ owner, repo, issue_number: issue.number, ...data }),
+  }
+
+  await handlePlan(handlerCtx, config, deps, issue)
+}
+
+/**
+ * Process a merged PR that was created by AgentGit (equivalent to pull_request.closed webhook).
+ */
+export async function processMergedAgentPr(
+  octokit: any,
+  owner: string,
+  repo: string,
+  pr: any,
+  deps: HandlerDeps,
+  config: any,
+): Promise<void> {
+  if (!pr.merged) return
+
+  const branchPrefix = config.execution.branch_prefix || "agent/"
+  const provenance = verifyPrProvenance(
+    {
+      user: { login: pr.user.login, type: pr.user.type },
+      body: pr.body || "",
+      head: { ref: pr.head.ref },
+    },
+    deps.appSlug,
+    branchPrefix,
+    deps.signingSecret,
+  )
+
+  if (!provenance.valid) return
+
+  const parsed = parseMetadataComment(pr.body || "")
+  if (!parsed) return
+
+  const metadata = parsed.metadata as Record<string, any>
+  const issueNumber = metadata.issue_number
+  if (!issueNumber) return
+
+  deps.logger.info(`PR #${pr.number} merged for issue #${issueNumber}`, {
+    repo: `${owner}/${repo}`,
+  })
+
+  await deps.stateManager.transition(
+    octokit,
+    owner,
+    repo,
+    issueNumber,
+    "pr_merged",
+  )
+
+  await octokit.issues.createComment({
+    owner,
+    repo,
+    issue_number: issueNumber,
+    body: createStatusComment("Completed", `PR #${pr.number} has been merged. Issue resolved.`),
+  })
+}
+
+// ── App setup and startup ──
+
+export function createAgentGitDeps(): HandlerDeps {
   const logLevel = (process.env.AGENTGIT_LOG_LEVEL as any) || "info"
   const logger = createLogger(logLevel, { component: "agentgit" })
   const stateManager = createStateManager()
@@ -61,215 +267,35 @@ export default function agentGitApp(app: Probot): void {
   skillRegistry.register(new LintRunnerSkill())
   skillRegistry.register(new PrCreatorSkill())
 
-  const deps: HandlerDeps = {
+  return {
     stateManager,
     skillRegistry,
     signingSecret,
     appSlug,
     logger,
   }
+}
 
-  // ── Issue Comment Handler ──
-  app.on("issue_comment.created", async (context) => {
-    const comment = context.payload.comment
-    const issue = context.payload.issue
-    const sender = context.payload.sender
+/**
+ * Start the AgentGit polling loop.
+ * This is the main entry point -- no inbound webhooks, no public ports.
+ */
+export async function startAgentGit(getOctokit: () => any): Promise<Poller> {
+  const deps = createAgentGitDeps()
+  const pollIntervalMs = parseInt(process.env.AGENTGIT_POLL_INTERVAL_MS || "30000", 10)
+  const workerId = process.env.AGENTGIT_WORKER_ID || `local-${process.pid}`
 
-    // Parse command
-    const command = parseCommand(comment.body)
-    if (!command) return
+  const poller = createPoller(getOctokit, {
+    intervalMs: pollIntervalMs,
+    staleThresholdMs: 30 * 60 * 1000,
+    appSlug: deps.appSlug,
+    signingSecret: deps.signingSecret,
+    workerId,
+    deps,
+  }, deps.logger)
 
-    const { owner, repo } = context.repo()
+  poller.start()
+  deps.logger.info("AgentGit polling started", { intervalMs: pollIntervalMs, workerId })
 
-    // Load config
-    const { config } = await loadConfig(context.octokit, owner, repo)
-    if (!config.enabled) return
-
-    // Build auth context
-    const authContext: AuthorizationContext = {
-      senderLogin: sender.login,
-      repoOwner: owner,
-      repoName: repo,
-      issueNumber: issue.number,
-      requiredPermissions: config.approval.required_permissions as any,
-      allowedUsers: config.approval.allowed_users,
-      securityAdmins: config.security.security_admins,
-      minDelegatePermission: config.approval.delegation.min_delegate_permission as any,
-    }
-
-    // Check authorization (with delegation support)
-    const getDelegations = async (issueNum: number) => {
-      const comments = await context.octokit.issues.listComments(
-        context.issue(),
-      )
-      const delegations = getActiveDelegations(
-        comments.data.map((c: any) => ({
-          user: { login: c.user!.login, type: c.user!.type },
-          body: c.body || "",
-        })),
-        appSlug,
-        signingSecret,
-        issueNum,
-      )
-      return delegations.map((d) => ({
-        username: d.delegated_to,
-        command: d.scopes.includes(command.action) ? command.action : "",
-      }))
-    }
-
-    const authResult = await isAuthorized(
-      context.octokit,
-      command.action,
-      authContext,
-      getDelegations,
-    )
-    if (!authResult.authorized) {
-      await context.octokit.issues.createComment(
-        context.issue({ body: `@${sender.login} ${authResult.reason}` }),
-      )
-      return
-    }
-
-    // Wrap Probot context as HandlerContext
-    const handlerCtx: HandlerContext = {
-      octokit: context.octokit,
-      repo: () => context.repo(),
-      issue: (data?: any) => context.issue(data),
-    }
-
-    // Dispatch command
-    logger.info(`Dispatching command: ${command.action}`, {
-      sender: sender.login,
-      issue: issue.number,
-      repo: `${owner}/${repo}`,
-    })
-
-    switch (command.action) {
-      case "plan":
-        await handlePlan(handlerCtx, config, deps, issue)
-        break
-      case "approve":
-        await handleApprove(handlerCtx, config, deps, issue, sender.login)
-        break
-      case "revise":
-        await handleRevise(handlerCtx, config, deps, issue, command.args)
-        break
-      case "run":
-        await handleRun(handlerCtx, config, deps, issue, sender.login)
-        break
-      case "stop":
-        await handleStop(handlerCtx, deps, sender.login)
-        break
-      case "retry":
-        await handleRetry(handlerCtx, config, deps, issue)
-        break
-      case "status":
-        await handleStatus(handlerCtx, deps)
-        break
-      case "delegate":
-        await handleDelegate(handlerCtx, deps, command.args, sender.login, issue)
-        break
-      case "undelegate":
-        await handleUndelegate(handlerCtx, deps, command.args, sender.login, issue)
-        break
-      case "delegates":
-        await handleListDelegates(handlerCtx, deps, issue)
-        break
-      case "unlock-security":
-        await handleUnlockSecurity(handlerCtx, deps, config, issue, sender.login)
-        break
-      case "close-unsafe":
-        await handleCloseUnsafe(handlerCtx, deps, sender.login)
-        break
-      case "security-status":
-        await handleSecurityStatus(handlerCtx, deps)
-        break
-      default:
-        logger.warn(`Unknown command action: ${command.action}`)
-    }
-  })
-
-  // ── Label Handler ──
-  app.on("issues.labeled", async (context) => {
-    const label = context.payload.label?.name
-    const issue = context.payload.issue
-
-    // Only trigger on configured ready labels
-    const { owner, repo } = context.repo()
-    const { config } = await loadConfig(context.octokit, owner, repo)
-    if (!config.enabled) return
-
-    const readyLabels = config.ready_labels || ["agent:ready"]
-    if (!label || !readyLabels.includes(label)) return
-
-    logger.info(`Ready label added: ${label}`, {
-      issue: issue.number,
-      repo: `${owner}/${repo}`,
-    })
-
-    const handlerCtx: HandlerContext = {
-      octokit: context.octokit,
-      repo: () => context.repo(),
-      issue: (data?: any) => context.issue(data),
-    }
-
-    // Trigger plan flow (same as /agent plan)
-    await handlePlan(handlerCtx, config, deps, issue)
-  })
-
-  // ── PR Merged Handler ──
-  app.on("pull_request.closed", async (context) => {
-    const pr = context.payload.pull_request
-    if (!pr.merged) return
-
-    const { owner, repo } = context.repo()
-    const { config } = await loadConfig(context.octokit, owner, repo)
-    if (!config.enabled) return
-
-    // Check if PR was created by the bot
-    const branchPrefix = config.execution.branch_prefix || "agent/"
-    const provenance = verifyPrProvenance(
-      {
-        user: { login: pr.user.login, type: pr.user.type },
-        body: pr.body || "",
-        head: { ref: pr.head.ref },
-      },
-      appSlug,
-      branchPrefix,
-      signingSecret,
-    )
-
-    if (!provenance.valid) return
-
-    // Find linked issue from PR body metadata
-    const parsed = parseMetadataComment(pr.body || "")
-    if (!parsed) return
-
-    const metadata = parsed.metadata as Record<string, any>
-    const issueNumber = metadata.issue_number
-    if (!issueNumber) return
-
-    logger.info(`PR #${pr.number} merged for issue #${issueNumber}`, {
-      repo: `${owner}/${repo}`,
-    })
-
-    // Transition to done
-    await stateManager.transition(
-      context.octokit as any,
-      owner,
-      repo,
-      issueNumber,
-      "pr_merged",
-    )
-
-    // Post completion comment on the issue
-    await context.octokit.issues.createComment({
-      owner,
-      repo,
-      issue_number: issueNumber,
-      body: createStatusComment("Completed", `PR #${pr.number} has been merged. Issue resolved.`),
-    })
-  })
-
-  logger.info("AgentGit app loaded successfully")
+  return poller
 }

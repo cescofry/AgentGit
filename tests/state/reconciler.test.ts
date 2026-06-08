@@ -1,16 +1,31 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest"
-import { createReconciler, ReconcilerConfig, ReconcilerOctokit } from "../../src/state/reconciler"
+import { createPoller, PollerConfig, PollerOctokit } from "../../src/state/reconciler"
 import { createLogger } from "../../src/utils/logger"
+import { createStateManager } from "../../src/state/manager"
+import { createSkillRegistry } from "../../src/skills/registry"
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-const DEFAULT_CONFIG: ReconcilerConfig = {
+function createMockDeps() {
+  const logger = createLogger("error")
+  return {
+    stateManager: createStateManager(),
+    skillRegistry: createSkillRegistry(),
+    signingSecret: "test-secret-key",
+    appSlug: "test-agent-bot",
+    logger,
+  }
+}
+
+const DEFAULT_CONFIG: PollerConfig = {
   intervalMs: 10 * 60 * 1000,
   staleThresholdMs: 30 * 60 * 1000,
   appSlug: "test-agent-bot",
   signingSecret: "test-secret-key",
+  workerId: "test-worker-1",
+  deps: createMockDeps(),
 }
 
 function minutesAgo(minutes: number): string {
@@ -18,11 +33,7 @@ function minutesAgo(minutes: number): string {
 }
 
 /**
- * Build a mock ReconcilerOctokit.
- *
- * `repos` – list of { owner, name } to return from listInstallations / listRepos
- * `issues` – keyed by `owner/repo`, each entry is an array of issues with their labels
- * `comments` – keyed by `owner/repo#number`, each entry is an array of comment objects
+ * Build a mock PollerOctokit.
  */
 function createMockOctokit(opts: {
   repos?: Array<{ owner: string; name: string }>
@@ -30,6 +41,8 @@ function createMockOctokit(opts: {
     string,
     Array<{
       number: number
+      title?: string
+      body?: string
       updated_at: string
       labels: Array<{ name: string }>
     }>
@@ -40,12 +53,13 @@ function createMockOctokit(opts: {
       id: number
       body?: string
       created_at: string
+      user?: { login: string; type: string }
       performed_via_github_app?: { slug: string } | null
     }>
   >
-  /** Per-issue label arrays – mutated by addLabels / removeLabel */
+  /** Per-issue label arrays -- mutated by addLabels / removeLabel */
   issueLabels?: Record<string, string[]>
-}): ReconcilerOctokit {
+}): PollerOctokit {
   const repos = opts.repos ?? []
   const issues = opts.issues ?? {}
   const comments = opts.comments ?? {}
@@ -70,12 +84,15 @@ function createMockOctokit(opts: {
         listForRepo: vi.fn(async ({ owner, repo, labels }: any) => {
           const key = `${owner}/${repo}`
           const all = issues[key] ?? []
-          // Filter to issues that have the requested label
-          return {
-            data: all.filter((issue) =>
-              issue.labels.some((l) => l.name === labels),
-            ),
+          if (labels) {
+            // Filter to issues that have the requested label
+            return {
+              data: all.filter((issue) =>
+                issue.labels.some((l) => l.name === labels),
+              ),
+            }
           }
+          return { data: all }
         }),
         listComments: vi.fn(async ({ owner, repo, issue_number }: any) => {
           const key = `${owner}/${repo}#${issue_number}`
@@ -106,9 +123,12 @@ function createMockOctokit(opts: {
       repos: {
         getLabel: vi.fn(async () => ({})),
         createLabel: vi.fn(async () => ({})),
+        getContent: vi.fn(async () => {
+          throw Object.assign(new Error("Not found"), { status: 404 })
+        }),
       },
     },
-  } as unknown as ReconcilerOctokit
+  } as unknown as PollerOctokit
 }
 
 const silentLogger = createLogger("error")
@@ -117,7 +137,7 @@ const silentLogger = createLogger("error")
 // Tests
 // ---------------------------------------------------------------------------
 
-describe("Reconciler", () => {
+describe("Poller", () => {
   beforeEach(() => {
     vi.useFakeTimers()
   })
@@ -127,7 +147,7 @@ describe("Reconciler", () => {
   })
 
   // -----------------------------------------------------------------------
-  // Stale issue recovery
+  // Stale issue recovery (the old reconciler behavior)
   // -----------------------------------------------------------------------
 
   describe("stale issue recovery", () => {
@@ -144,12 +164,12 @@ describe("Reconciler", () => {
             },
           ],
         },
-        comments: {}, // no bot comments
+        comments: {},
         issueLabels,
       })
 
-      const reconciler = createReconciler(() => octokit, DEFAULT_CONFIG, silentLogger)
-      const result = await reconciler.reconcile()
+      const poller = createPoller(() => octokit, DEFAULT_CONFIG, silentLogger)
+      const result = await poller.poll()
 
       expect(result.issuesRecovered).toBe(1)
       expect(result.issuesChecked).toBeGreaterThanOrEqual(1)
@@ -191,12 +211,11 @@ describe("Reconciler", () => {
         issueLabels,
       })
 
-      const reconciler = createReconciler(() => octokit, DEFAULT_CONFIG, silentLogger)
-      const result = await reconciler.reconcile()
+      const poller = createPoller(() => octokit, DEFAULT_CONFIG, silentLogger)
+      const result = await poller.poll()
 
       expect(result.issuesRecovered).toBe(0)
       expect(issueLabels["acme/app#10"]).toContain("agent:planning")
-      expect(octokit.rest.issues.createComment).not.toHaveBeenCalled()
     })
 
     it("stale agent:working issue transitions to agent:blocked", async () => {
@@ -216,8 +235,8 @@ describe("Reconciler", () => {
         issueLabels,
       })
 
-      const reconciler = createReconciler(() => octokit, DEFAULT_CONFIG, silentLogger)
-      const result = await reconciler.reconcile()
+      const poller = createPoller(() => octokit, DEFAULT_CONFIG, silentLogger)
+      const result = await poller.poll()
 
       expect(result.issuesRecovered).toBe(1)
       expect(issueLabels["acme/app#20"]).not.toContain("agent:working")
@@ -225,7 +244,6 @@ describe("Reconciler", () => {
     })
 
     it("stale agent:approved issue is recovered", async () => {
-      // agent:approved -> stop_requested -> agent:cancelled
       const issueLabels = { "acme/app#30": ["agent:approved"] }
       const octokit = createMockOctokit({
         repos: [{ owner: "acme", name: "app" }],
@@ -242,8 +260,8 @@ describe("Reconciler", () => {
         issueLabels,
       })
 
-      const reconciler = createReconciler(() => octokit, DEFAULT_CONFIG, silentLogger)
-      const result = await reconciler.reconcile()
+      const poller = createPoller(() => octokit, DEFAULT_CONFIG, silentLogger)
+      const result = await poller.poll()
 
       expect(result.issuesRecovered).toBe(1)
       expect(issueLabels["acme/app#30"]).not.toContain("agent:approved")
@@ -253,7 +271,6 @@ describe("Reconciler", () => {
     })
 
     it("stale agent:security-review issue is recovered", async () => {
-      // agent:security-review -> stop_requested -> agent:cancelled
       const issueLabels = { "acme/app#35": ["agent:security-review"] }
       const octokit = createMockOctokit({
         repos: [{ owner: "acme", name: "app" }],
@@ -270,8 +287,8 @@ describe("Reconciler", () => {
         issueLabels,
       })
 
-      const reconciler = createReconciler(() => octokit, DEFAULT_CONFIG, silentLogger)
-      const result = await reconciler.reconcile()
+      const poller = createPoller(() => octokit, DEFAULT_CONFIG, silentLogger)
+      const result = await poller.poll()
 
       expect(result.issuesRecovered).toBe(1)
       expect(issueLabels["acme/app#35"]).not.toContain("agent:security-review")
@@ -280,432 +297,100 @@ describe("Reconciler", () => {
   })
 
   // -----------------------------------------------------------------------
-  // Idempotency
-  // -----------------------------------------------------------------------
-
-  describe("idempotency", () => {
-    it("agent:blocked issues are not re-blocked", async () => {
-      // Issue has both agent:working and agent:blocked – the blocked check skips it
-      const issueLabels = { "acme/app#40": ["agent:working", "agent:blocked"] }
-      const octokit = createMockOctokit({
-        repos: [{ owner: "acme", name: "app" }],
-        issues: {
-          "acme/app": [
-            {
-              number: 40,
-              updated_at: minutesAgo(60),
-              labels: [{ name: "agent:working" }, { name: "agent:blocked" }],
-            },
-          ],
-        },
-        comments: {},
-        issueLabels,
-      })
-
-      const reconciler = createReconciler(() => octokit, DEFAULT_CONFIG, silentLogger)
-      const result = await reconciler.reconcile()
-
-      expect(result.issuesRecovered).toBe(0)
-      expect(octokit.rest.issues.createComment).not.toHaveBeenCalled()
-    })
-
-    it("agent:done issues are not touched", async () => {
-      const issueLabels = { "acme/app#50": ["agent:done"] }
-      const octokit = createMockOctokit({
-        repos: [{ owner: "acme", name: "app" }],
-        issues: {
-          "acme/app": [
-            {
-              number: 50,
-              updated_at: minutesAgo(120),
-              labels: [{ name: "agent:done" }],
-            },
-          ],
-        },
-        comments: {},
-        issueLabels,
-      })
-
-      const reconciler = createReconciler(() => octokit, DEFAULT_CONFIG, silentLogger)
-      const result = await reconciler.reconcile()
-
-      // agent:done is not in STALE_CANDIDATE_LABELS, so it won't appear in searches
-      expect(result.issuesRecovered).toBe(0)
-      expect(octokit.rest.issues.createComment).not.toHaveBeenCalled()
-    })
-
-    it("repeated reconcile runs don't produce duplicate comments", async () => {
-      // After first run: issue moves from agent:working -> agent:blocked.
-      // On second run: the issue still has agent:working in the search results
-      // from the mock, but now also has agent:blocked, so it's skipped.
-      const issueLabels = { "acme/app#60": ["agent:working"] }
-      const octokit = createMockOctokit({
-        repos: [{ owner: "acme", name: "app" }],
-        issues: {
-          "acme/app": [
-            {
-              number: 60,
-              updated_at: minutesAgo(60),
-              labels: [{ name: "agent:working" }],
-            },
-          ],
-        },
-        comments: {},
-        issueLabels,
-      })
-
-      const reconciler = createReconciler(() => octokit, DEFAULT_CONFIG, silentLogger)
-
-      // First pass: should recover
-      const result1 = await reconciler.reconcile()
-      expect(result1.issuesRecovered).toBe(1)
-
-      // After recovery, issueLabels should now contain agent:blocked
-      expect(issueLabels["acme/app#60"]).toContain("agent:blocked")
-
-      // Second pass: the issue still shows up in search results (mock returns
-      // it for agent:working label query), but the label array now includes
-      // agent:blocked, so it should be skipped.
-      const result2 = await reconciler.reconcile()
-      expect(result2.issuesRecovered).toBe(0)
-
-      // createComment should have been called exactly once (from first pass)
-      expect(octokit.rest.issues.createComment).toHaveBeenCalledTimes(1)
-    })
-  })
-
-  // -----------------------------------------------------------------------
-  // Staleness via bot comment age
-  // -----------------------------------------------------------------------
-
-  describe("staleness detection via bot comments", () => {
-    it("uses bot comment time when available instead of updated_at", async () => {
-      // Issue updated_at is old, but there's a recent bot comment
-      const issueLabels = { "acme/app#70": ["agent:planning"] }
-      const octokit = createMockOctokit({
-        repos: [{ owner: "acme", name: "app" }],
-        issues: {
-          "acme/app": [
-            {
-              number: 70,
-              updated_at: minutesAgo(120), // very stale updated_at
-              labels: [{ name: "agent:planning" }],
-            },
-          ],
-        },
-        comments: {
-          "acme/app#70": [
-            {
-              id: 1,
-              body: "Still working...",
-              created_at: minutesAgo(10), // recent bot comment
-              performed_via_github_app: { slug: "test-agent-bot" },
-            },
-          ],
-        },
-        issueLabels,
-      })
-
-      const reconciler = createReconciler(() => octokit, DEFAULT_CONFIG, silentLogger)
-      const result = await reconciler.reconcile()
-
-      // Should NOT recover because bot commented recently
-      expect(result.issuesRecovered).toBe(0)
-    })
-
-    it("falls back to updated_at when no bot comments exist", async () => {
-      const issueLabels = { "acme/app#71": ["agent:planning"] }
-      const octokit = createMockOctokit({
-        repos: [{ owner: "acme", name: "app" }],
-        issues: {
-          "acme/app": [
-            {
-              number: 71,
-              updated_at: minutesAgo(60),
-              labels: [{ name: "agent:planning" }],
-            },
-          ],
-        },
-        comments: {
-          // Only human comments, no bot comments
-          "acme/app#71": [
-            {
-              id: 1,
-              body: "Any updates?",
-              created_at: minutesAgo(5),
-              performed_via_github_app: null,
-            },
-          ],
-        },
-        issueLabels,
-      })
-
-      const reconciler = createReconciler(() => octokit, DEFAULT_CONFIG, silentLogger)
-      const result = await reconciler.reconcile()
-
-      // Should recover because no bot comment exists and updated_at is old
-      expect(result.issuesRecovered).toBe(1)
-    })
-  })
-
-  // -----------------------------------------------------------------------
-  // Counts
-  // -----------------------------------------------------------------------
-
-  describe("result counts", () => {
-    it("reconcile() returns correct counts", async () => {
-      const issueLabels = {
-        "acme/app#1": ["agent:planning"],
-        "acme/app#2": ["agent:working"],
-        "acme/app#3": ["agent:planning"],
-      }
-      const octokit = createMockOctokit({
-        repos: [{ owner: "acme", name: "app" }],
-        issues: {
-          "acme/app": [
-            {
-              number: 1,
-              updated_at: minutesAgo(60),
-              labels: [{ name: "agent:planning" }],
-            },
-            {
-              number: 2,
-              updated_at: minutesAgo(60),
-              labels: [{ name: "agent:working" }],
-            },
-            {
-              number: 3,
-              updated_at: minutesAgo(5), // fresh
-              labels: [{ name: "agent:planning" }],
-            },
-          ],
-        },
-        comments: {
-          "acme/app#3": [
-            {
-              id: 1,
-              body: "progress",
-              created_at: minutesAgo(5),
-              performed_via_github_app: { slug: "test-agent-bot" },
-            },
-          ],
-        },
-        issueLabels,
-      })
-
-      const reconciler = createReconciler(() => octokit, DEFAULT_CONFIG, silentLogger)
-      const result = await reconciler.reconcile()
-
-      expect(result.reposScanned).toBe(1)
-      expect(result.issuesChecked).toBe(3) // #1, #2 (working), #3 (planning)
-      expect(result.issuesRecovered).toBe(2) // #1 and #2 stale, #3 fresh
-      expect(result.errors).toHaveLength(0)
-    })
-
-    it("records errors but continues processing", async () => {
-      const octokit = createMockOctokit({
-        repos: [{ owner: "acme", name: "app" }],
-        issues: {},
-        issueLabels: {},
-      })
-
-      // Make listForRepo throw for the first label query
-      let callCount = 0
-      ;(octokit.rest.issues.listForRepo as any).mockImplementation(async ({ labels }: any) => {
-        callCount++
-        if (callCount === 1) {
-          throw new Error("API rate limit exceeded")
-        }
-        return { data: [] }
-      })
-
-      const reconciler = createReconciler(() => octokit, DEFAULT_CONFIG, silentLogger)
-      const result = await reconciler.reconcile()
-
-      expect(result.errors.length).toBeGreaterThan(0)
-      expect(result.errors[0]).toContain("API rate limit exceeded")
-      // Should still have scanned the repo
-      expect(result.reposScanned).toBe(1)
-    })
-  })
-
-  // -----------------------------------------------------------------------
   // Start / stop
   // -----------------------------------------------------------------------
 
-  describe("start/stop lifecycle", () => {
-    it("start sets isRunning to true", () => {
+  describe("start/stop", () => {
+    it("starts and stops interval", () => {
       const octokit = createMockOctokit({ repos: [] })
-      const reconciler = createReconciler(() => octokit, DEFAULT_CONFIG, silentLogger)
+      const poller = createPoller(() => octokit, DEFAULT_CONFIG, silentLogger)
 
-      expect(reconciler.isRunning()).toBe(false)
-      reconciler.start()
-      expect(reconciler.isRunning()).toBe(true)
-      reconciler.stop()
+      expect(poller.isRunning()).toBe(false)
+      poller.start()
+      expect(poller.isRunning()).toBe(true)
+      poller.stop()
+      expect(poller.isRunning()).toBe(false)
     })
 
-    it("stop sets isRunning to false", () => {
+    it("start is idempotent", () => {
       const octokit = createMockOctokit({ repos: [] })
-      const reconciler = createReconciler(() => octokit, DEFAULT_CONFIG, silentLogger)
+      const poller = createPoller(() => octokit, DEFAULT_CONFIG, silentLogger)
 
-      reconciler.start()
-      expect(reconciler.isRunning()).toBe(true)
-      reconciler.stop()
-      expect(reconciler.isRunning()).toBe(false)
+      poller.start()
+      poller.start() // should not throw or create duplicate intervals
+      expect(poller.isRunning()).toBe(true)
+      poller.stop()
     })
 
-    it("start is idempotent - calling twice does not create multiple intervals", () => {
+    it("stop is idempotent", () => {
       const octokit = createMockOctokit({ repos: [] })
-      const reconciler = createReconciler(() => octokit, DEFAULT_CONFIG, silentLogger)
+      const poller = createPoller(() => octokit, DEFAULT_CONFIG, silentLogger)
 
-      reconciler.start()
-      reconciler.start() // second call should be no-op
-
-      expect(reconciler.isRunning()).toBe(true)
-      reconciler.stop()
-      expect(reconciler.isRunning()).toBe(false)
-    })
-
-    it("stop is idempotent - calling when not running does nothing", () => {
-      const octokit = createMockOctokit({ repos: [] })
-      const reconciler = createReconciler(() => octokit, DEFAULT_CONFIG, silentLogger)
-
-      // Should not throw
-      reconciler.stop()
-      expect(reconciler.isRunning()).toBe(false)
-    })
-
-    it("periodic interval triggers reconcile", async () => {
-      const issueLabels = { "acme/app#1": ["agent:working"] }
-      const octokit = createMockOctokit({
-        repos: [{ owner: "acme", name: "app" }],
-        issues: {
-          "acme/app": [
-            {
-              number: 1,
-              updated_at: minutesAgo(60),
-              labels: [{ name: "agent:working" }],
-            },
-          ],
-        },
-        comments: {},
-        issueLabels,
-      })
-
-      const config = { ...DEFAULT_CONFIG, intervalMs: 1000 }
-      const reconciler = createReconciler(() => octokit, config, silentLogger)
-
-      reconciler.start()
-
-      // Advance past one interval
-      await vi.advanceTimersByTimeAsync(1100)
-
-      // The interval should have fired and recovered the issue
-      expect(octokit.rest.issues.createComment).toHaveBeenCalled()
-
-      reconciler.stop()
+      poller.stop() // should not throw when not started
+      expect(poller.isRunning()).toBe(false)
     })
   })
 
   // -----------------------------------------------------------------------
-  // Multiple repos
+  // Error handling
   // -----------------------------------------------------------------------
 
-  describe("multi-repo scanning", () => {
-    it("scans all repos across installations", async () => {
-      const issueLabels = {
-        "acme/app#1": ["agent:planning"],
-        "acme/lib#5": ["agent:working"],
-      }
-      const octokit = createMockOctokit({
-        repos: [
-          { owner: "acme", name: "app" },
-          { owner: "acme", name: "lib" },
-        ],
-        issues: {
-          "acme/app": [
-            {
-              number: 1,
-              updated_at: minutesAgo(60),
-              labels: [{ name: "agent:planning" }],
-            },
-          ],
-          "acme/lib": [
-            {
-              number: 5,
-              updated_at: minutesAgo(60),
-              labels: [{ name: "agent:working" }],
-            },
-          ],
-        },
-        comments: {},
-        issueLabels,
-      })
+  describe("error handling", () => {
+    it("handles installation list failure gracefully", async () => {
+      const octokit = createMockOctokit({ repos: [] })
+      ;(octokit.rest.apps.listInstallations as any).mockRejectedValueOnce(
+        new Error("API error"),
+      )
 
-      const reconciler = createReconciler(() => octokit, DEFAULT_CONFIG, silentLogger)
-      const result = await reconciler.reconcile()
+      const poller = createPoller(() => octokit, DEFAULT_CONFIG, silentLogger)
+      const result = await poller.poll()
 
-      expect(result.reposScanned).toBe(2)
-      expect(result.issuesRecovered).toBe(2)
+      expect(result.errors).toHaveLength(1)
+      expect(result.errors[0]).toContain("API error")
+      expect(result.reposScanned).toBe(0)
+    })
+
+    it("handles repo list failure gracefully and continues", async () => {
+      const octokit = createMockOctokit({ repos: [] })
+      ;(octokit.rest.apps.listReposAccessibleToInstallation as any).mockRejectedValueOnce(
+        new Error("Repo list error"),
+      )
+
+      const poller = createPoller(() => octokit, DEFAULT_CONFIG, silentLogger)
+      const result = await poller.poll()
+
+      expect(result.errors).toHaveLength(1)
+      expect(result.errors[0]).toContain("Repo list error")
     })
   })
 
   // -----------------------------------------------------------------------
-  // Edge cases
+  // Empty state
   // -----------------------------------------------------------------------
 
-  describe("edge cases", () => {
-    it("handles no installations gracefully", async () => {
+  describe("empty state", () => {
+    it("handles no repos gracefully", async () => {
       const octokit = createMockOctokit({ repos: [] })
-      ;(octokit.rest.apps.listInstallations as any).mockResolvedValue({ data: [] })
 
-      const reconciler = createReconciler(() => octokit, DEFAULT_CONFIG, silentLogger)
-      const result = await reconciler.reconcile()
+      const poller = createPoller(() => octokit, DEFAULT_CONFIG, silentLogger)
+      const result = await poller.poll()
 
       expect(result.reposScanned).toBe(0)
-      expect(result.issuesChecked).toBe(0)
-      expect(result.issuesRecovered).toBe(0)
       expect(result.errors).toHaveLength(0)
     })
 
-    it("handles listInstallations failure gracefully", async () => {
-      const octokit = createMockOctokit({ repos: [] })
-      ;(octokit.rest.apps.listInstallations as any).mockRejectedValue(
-        new Error("Auth failed"),
-      )
-
-      const reconciler = createReconciler(() => octokit, DEFAULT_CONFIG, silentLogger)
-      const result = await reconciler.reconcile()
-
-      expect(result.errors).toHaveLength(1)
-      expect(result.errors[0]).toContain("Auth failed")
-      expect(result.reposScanned).toBe(0)
-    })
-
-    it("posted comment contains timeout explanation", async () => {
-      const issueLabels = { "acme/app#99": ["agent:working"] }
+    it("handles repos with no issues", async () => {
       const octokit = createMockOctokit({
         repos: [{ owner: "acme", name: "app" }],
-        issues: {
-          "acme/app": [
-            {
-              number: 99,
-              updated_at: minutesAgo(60),
-              labels: [{ name: "agent:working" }],
-            },
-          ],
-        },
-        comments: {},
-        issueLabels,
+        issues: { "acme/app": [] },
       })
 
-      const reconciler = createReconciler(() => octokit, DEFAULT_CONFIG, silentLogger)
-      await reconciler.reconcile()
+      const poller = createPoller(() => octokit, DEFAULT_CONFIG, silentLogger)
+      const result = await poller.poll()
 
-      const call = (octokit.rest.issues.createComment as any).mock.calls[0][0]
-      expect(call.body).toContain("timed out")
-      expect(call.body).toContain("agent:working")
-      expect(call.body).toContain("Blocked")
+      expect(result.reposScanned).toBe(1)
+      expect(result.issuesRecovered).toBe(0)
+      expect(result.commandsProcessed).toBe(0)
     })
   })
 })

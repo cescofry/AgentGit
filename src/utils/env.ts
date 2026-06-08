@@ -4,17 +4,16 @@ import type { LogLevel } from "./logger"
 export interface EnvConfig {
   GITHUB_APP_ID: string
   GITHUB_APP_PRIVATE_KEY: string
-  GITHUB_WEBHOOK_SECRET: string
   AGENTGIT_SIGNING_SECRET: string
-  AGENTGIT_PORT: number
   AGENTGIT_LOG_LEVEL: LogLevel
+  AGENTGIT_POLL_INTERVAL_MS: number
+  AGENTGIT_WORKER_ID: string
 }
 
 const VALID_LOG_LEVELS: LogLevel[] = ["debug", "info", "warn", "error"]
 
 const REQUIRED_VARS = [
   "GITHUB_APP_ID",
-  "GITHUB_WEBHOOK_SECRET",
   "AGENTGIT_SIGNING_SECRET",
 ] as const
 
@@ -39,13 +38,13 @@ function resolvePrivateKey(): string {
   )
 }
 
-function resolvePort(): number {
-  const raw = process.env.AGENTGIT_PORT
-  if (!raw) return 3000
+function resolvePollInterval(): number {
+  const raw = process.env.AGENTGIT_POLL_INTERVAL_MS
+  if (!raw) return 30000 // default 30 seconds
 
   const parsed = parseInt(raw, 10)
-  if (isNaN(parsed) || parsed < 1 || parsed > 65535) {
-    throw new Error(`AGENTGIT_PORT must be a valid port number (1-65535), got: ${raw}`)
+  if (isNaN(parsed) || parsed < 5000) {
+    throw new Error(`AGENTGIT_POLL_INTERVAL_MS must be a number >= 5000, got: ${raw}`)
   }
   return parsed
 }
@@ -60,6 +59,15 @@ function resolveLogLevel(): LogLevel {
     )
   }
   return raw as LogLevel
+}
+
+function resolveWorkerId(): string {
+  const raw = process.env.AGENTGIT_WORKER_ID
+  if (raw) return raw
+
+  // Generate a default worker ID from hostname + pid
+  const hostname = process.env.HOSTNAME || "local"
+  return `${hostname}-${process.pid}`
 }
 
 /**
@@ -77,10 +85,10 @@ export function loadEnv(): EnvConfig {
   return {
     GITHUB_APP_ID: process.env.GITHUB_APP_ID!,
     GITHUB_APP_PRIVATE_KEY: resolvePrivateKey(),
-    GITHUB_WEBHOOK_SECRET: process.env.GITHUB_WEBHOOK_SECRET!,
     AGENTGIT_SIGNING_SECRET: process.env.AGENTGIT_SIGNING_SECRET!,
-    AGENTGIT_PORT: resolvePort(),
     AGENTGIT_LOG_LEVEL: resolveLogLevel(),
+    AGENTGIT_POLL_INTERVAL_MS: resolvePollInterval(),
+    AGENTGIT_WORKER_ID: resolveWorkerId(),
   }
 }
 
@@ -108,8 +116,8 @@ export function validateEnv(partial?: boolean): {
   }
 
   // Optional vars with warnings
-  if (!process.env.AGENTGIT_PORT) {
-    warnings.push("AGENTGIT_PORT not set, defaulting to 3000")
+  if (!process.env.AGENTGIT_POLL_INTERVAL_MS) {
+    warnings.push("AGENTGIT_POLL_INTERVAL_MS not set, defaulting to 30000ms")
   }
 
   if (!process.env.AGENTGIT_LOG_LEVEL) {
